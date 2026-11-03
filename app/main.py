@@ -4,6 +4,7 @@ import os
 from db import (
     bind_user_to_class,
     create_class,
+    create_idea,
     ensure_user_role,
     get_admin_ids,
     get_setting_text,
@@ -29,6 +30,7 @@ def required_env(name: str) -> str:
 bot = Bot(required_env("MAX_BOT_TOKEN"))
 dispatcher = Dispatcher()
 pending_class_code_users: set[int] = set()
+pending_ideas: dict[int, dict[str, str]] = {}
 
 
 def main_keyboard(is_admin: bool = False):
@@ -114,6 +116,58 @@ async def start_handler(message: MessageCreated) -> None:
 async def echo_handler(message: MessageCreated) -> None:
     text = message.text or "Сообщение получено, но в нём нет текста."
 
+    if text.strip().lower() == "/cancel":
+        pending_class_code_users.discard(message.user_id)
+        pending_ideas.pop(message.user_id, None)
+        await message.answer(
+            "Текущий сценарий отменён.",
+            keyboard=main_keyboard(message.user_id in get_admin_ids()),
+        )
+        return
+
+    if message.user_id in pending_ideas:
+        idea = pending_ideas[message.user_id]
+        value = text.strip()
+
+        if idea["step"] == "title":
+            if not value or len(value) > 120:
+                await message.answer("Название должно быть от 1 до 120 символов. Попробуйте ещё раз.")
+                return
+            idea["title"] = value
+            idea["step"] = "description"
+            await message.answer("Шаг 2 из 3. Опишите идею (до 1000 символов).")
+            return
+
+        if idea["step"] == "description":
+            if not value or len(value) > 1000:
+                await message.answer("Описание должно быть от 1 до 1000 символов. Попробуйте ещё раз.")
+                return
+            idea["description"] = value
+            idea["step"] = "target_group"
+            await message.answer("Шаг 3 из 3. Для кого подходит идея? Например: 5-8 классы.")
+            return
+
+        if idea["step"] == "target_group":
+            if not value or len(value) > 100:
+                await message.answer("Укажите группу длиной до 100 символов.")
+                return
+            idea_id = await create_idea(
+                message.user_id,
+                idea["title"],
+                idea["description"],
+                value,
+            )
+            if idea_id is None:
+                await message.answer("Не удалось сохранить идею. Сначала привяжите пользователя к классу.")
+                return
+            pending_ideas.pop(message.user_id, None)
+            await message.answer(
+                f"Идея №{idea_id} отправлена на модерацию.\n"
+                "Решение модератора появится в уведомлениях.",
+                keyboard=main_keyboard(message.user_id in get_admin_ids()),
+            )
+            return
+
     if message.user_id in pending_class_code_users:
         user_class = await bind_user_to_class(message.user_id, text)
         if user_class is None:
@@ -182,6 +236,17 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer("Не удалось добавить класс: имя или код уже используются.")
             return
         await message.answer(f"Класс {parts[0]} добавлен. Код: {parts[2].upper()}")
+        return
+
+    if text == "💡 Подать идею":
+        if message.user_id is None or await get_user_class(message.user_id) is None:
+            await message.answer("Сначала привяжите пользователя к классу через /start.")
+            return
+        pending_ideas[message.user_id] = {"step": "title"}
+        await message.answer(
+            "Шаг 1 из 3. Введите название идеи (до 120 символов).\n"
+            "Для отмены отправьте /cancel."
+        )
         return
 
     menu_messages = {

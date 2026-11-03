@@ -179,3 +179,29 @@ async def list_classes_with_codes() -> list[tuple[str, str, str]]:
     finally:
         await connection.close()
 
+
+async def create_idea(
+    max_user_id: int,
+    title: str,
+    description: str,
+    target_group: str,
+) -> int | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            """
+            INSERT INTO ideas (title, description, target_group, author_class_id)
+            SELECT $1, $2, $3, class_id
+            FROM users
+            WHERE max_user_id = $4 AND class_id IS NOT NULL
+            RETURNING id
+            """,
+            title,
+            description,
+            target_group,
+            max_user_id,
+        )
+        return int(row["id"]) if row is not None else None
+    finally:
+        await connection.close()
+
