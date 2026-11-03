@@ -2,6 +2,7 @@ import asyncio
 import os
 
 from db import initialize_database
+from classes import SCHOOL_CLASSES, format_rating
 from maxo import Bot, Dispatcher
 from maxo.routing.filters import CommandStart
 from maxo.types import MessageCreated
@@ -46,7 +47,7 @@ async def echo_handler(message: MessageCreated) -> None:
 
     menu_messages = {
         "🎯 Ценность месяца": "🎯 Ценность месяца — Взаимопомощь.\nНастройку этого значения подключим к базе данных.",
-        "🏆 Рейтинг": "🏆 Рейтинг пока заполняется. На следующем шаге подключим классы и баллы.",
+        "🏆 Рейтинг": format_rating(SCHOOL_CLASSES),
         "🎪 Афиша": "🎪 Афиша пока пуста. Одобренные идеи будут появляться здесь.",
         "💡 Подать идею": "💡 Форма подачи идеи будет добавлена следующим этапом.",
     }
