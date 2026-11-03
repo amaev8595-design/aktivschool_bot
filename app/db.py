@@ -5,6 +5,15 @@ from pathlib import Path
 import asyncpg
 
 
+def get_admin_ids() -> set[int]:
+    admin_ids: set[int] = set()
+    for value in os.getenv("ADMIN_IDS", "").split(","):
+        value = value.strip()
+        if value.isdigit():
+            admin_ids.add(int(value))
+    return admin_ids
+
+
 def get_database_url() -> str:
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
@@ -79,6 +88,23 @@ async def bind_user_to_class(max_user_id: int, invite_code: str) -> tuple[str, s
             row["id"],
         )
         return row["name"], row["age_group"]
+    finally:
+        await connection.close()
+
+
+async def ensure_user_role(max_user_id: int, role: str) -> None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await connection.execute(
+            """
+            INSERT INTO users (max_user_id, role)
+            VALUES ($1, $2)
+            ON CONFLICT (max_user_id)
+            DO UPDATE SET role = EXCLUDED.role
+            """,
+            max_user_id,
+            role,
+        )
     finally:
         await connection.close()
 

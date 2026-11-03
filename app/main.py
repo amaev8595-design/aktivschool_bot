@@ -1,10 +1,16 @@
 import asyncio
 import os
 
-from db import bind_user_to_class, get_user_class, initialize_database
+from db import (
+    bind_user_to_class,
+    ensure_user_role,
+    get_admin_ids,
+    get_user_class,
+    initialize_database,
+)
 from classes import SCHOOL_CLASSES, format_rating
 from maxo import Bot, Dispatcher
-from maxo.routing.filters import CommandStart
+from maxo.routing.filters import Command, CommandStart
 from maxo.types import MessageCreated
 from maxo.utils.builders import KeyboardBuilder
 
@@ -21,16 +27,45 @@ dispatcher = Dispatcher()
 pending_class_code_users: set[int] = set()
 
 
-def main_keyboard():
-    return (
+def main_keyboard(is_admin: bool = False):
+    keyboard = (
         KeyboardBuilder()
         .add_message(text="🎯 Ценность месяца")
         .add_message(text="🏆 Рейтинг")
         .add_message(text="🎪 Афиша")
         .add_message(text="💡 Подать идею")
-        .adjust(2, 2)
-        .build()
     )
+    if is_admin:
+        keyboard.add_message(text="⚙️ Администрирование")
+        return keyboard.adjust(2, 2, 1).build()
+    return keyboard.adjust(2, 2).build()
+
+
+@dispatcher.message_created(Command("myid"))
+async def my_id_handler(message: MessageCreated) -> None:
+    if message.user_id is None:
+        await message.answer("Не удалось определить ID пользователя MAX.")
+        return
+    await message.answer(
+        f"Ваш технический ID MAX: {message.user_id}\n"
+        "Не публикуйте его. Он нужен только для ADMIN_IDS в локальном .env."
+    )
+
+
+async def admin_message(message: MessageCreated) -> None:
+    if message.user_id is None or message.user_id not in get_admin_ids():
+        await message.answer("У вас нет прав администратора.")
+        return
+    await ensure_user_role(message.user_id, "admin")
+    await message.answer(
+        "⚙️ Панель администратора\n"
+        "Роль подтверждена на стороне сервера. Команды настройки добавим следующим этапом."
+    )
+
+
+@dispatcher.message_created(Command("admin"))
+async def admin_command_handler(message: MessageCreated) -> None:
+    await admin_message(message)
 
 
 @dispatcher.message_created(CommandStart())
@@ -38,6 +73,16 @@ async def start_handler(message: MessageCreated) -> None:
     user_id = message.user_id
     if user_id is None:
         await message.answer("Не удалось определить пользователя MAX. Попробуйте ещё раз.")
+        return
+
+    is_admin = user_id in get_admin_ids()
+    if is_admin:
+        await ensure_user_role(user_id, "admin")
+        await message.answer(
+            "Привет! Вы вошли как администратор проекта «Актив».\n"
+            "Выберите раздел меню:",
+            keyboard=main_keyboard(is_admin=True),
+        )
         return
 
     user_class = await get_user_class(user_id)
@@ -75,6 +120,10 @@ async def echo_handler(message: MessageCreated) -> None:
             "Теперь доступно главное меню:",
             keyboard=main_keyboard(),
         )
+        return
+
+    if text == "⚙️ Администрирование":
+        await admin_message(message)
         return
 
     menu_messages = {
