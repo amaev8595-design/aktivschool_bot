@@ -108,6 +108,7 @@ async def admin_message(message: MessageCreated) -> None:
         "/setvalue Текст ценности месяца\n"
         "/addclass Название|группа|код\n"
         "/addevent Название|Описание|YYYY-MM-DD|Класс\n"
+        "Учитель: /addevent Название|Описание|YYYY-MM-DD\n"
         "/classes — список классов и кодов\n"
         "/users — список пользователей и ролей\n"
         "/setrole ID moderator|teacher|student\n"
@@ -325,23 +326,39 @@ async def echo_handler(message: MessageCreated) -> None:
         return
 
     if text == "/addevent" or text.startswith("/addevent "):
-        if not await is_admin_user(message.user_id):
-            await message.answer("У вас нет прав администратора.")
+        is_admin = await is_admin_user(message.user_id)
+        user_role = await get_user_role(message.user_id) if message.user_id is not None else None
+        if not is_admin and user_role != "teacher":
+            await message.answer("Добавлять мероприятия может только администратор или учитель.")
             return
         payload = text.removeprefix("/addevent").strip()
         parts = [part.strip() for part in payload.split("|")]
-        if len(parts) != 4 or not all(parts):
-            await message.answer(
-                "Формат: /addevent Название|Описание|YYYY-MM-DD|Класс\n"
-                "Пример: /addevent Квест благодарности|Командная игра|2026-11-08|9А"
-            )
-            return
+        if is_admin:
+            if len(parts) != 4 or not all(parts):
+                await message.answer(
+                    "Формат администратора: /addevent Название|Описание|YYYY-MM-DD|Класс\n"
+                    "Пример: /addevent Квест благодарности|Командная игра|2026-11-08|9А"
+                )
+                return
+            author_class_name = parts[3]
+        else:
+            if len(parts) != 3 or not all(parts):
+                await message.answer(
+                    "Формат учителя: /addevent Название|Описание|YYYY-MM-DD\n"
+                    "Мероприятие будет создано для привязанного класса."
+                )
+                return
+            user_class = await get_user_class(message.user_id)
+            if user_class is None:
+                await message.answer("Сначала привяжите учителя к классу через /start.")
+                return
+            author_class_name = user_class[0]
         try:
             event_date = date.fromisoformat(parts[2])
         except ValueError:
             await message.answer("Дата должна быть в формате YYYY-MM-DD, например 2026-11-08.")
             return
-        event_id = await create_event(parts[0], parts[1], event_date, parts[3])
+        event_id = await create_event(parts[0], parts[1], event_date, author_class_name)
         if event_id is None:
             await message.answer("Класс не найден. Сначала проверьте список командой /classes.")
             return
