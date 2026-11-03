@@ -15,6 +15,15 @@ def get_admin_ids() -> set[int]:
     return admin_ids
 
 
+def get_moderator_ids() -> set[int]:
+    moderator_ids: set[int] = set()
+    for value in os.getenv("MODERATOR_IDS", "").split(","):
+        value = value.strip()
+        if value.isdigit():
+            moderator_ids.add(int(value))
+    return moderator_ids
+
+
 def get_database_url() -> str:
     database_url = os.getenv("DATABASE_URL", "").strip()
     if not database_url:
@@ -190,8 +199,8 @@ async def create_idea(
     try:
         row = await connection.fetchrow(
             """
-            INSERT INTO ideas (title, description, target_group, author_class_id)
-            SELECT $1, $2, $3, class_id
+            INSERT INTO ideas (title, description, target_group, author_class_id, author_user_id)
+            SELECT $1, $2, $3, class_id, $4
             FROM users
             WHERE max_user_id = $4 AND class_id IS NOT NULL
             RETURNING id
@@ -202,6 +211,87 @@ async def create_idea(
             max_user_id,
         )
         return int(row["id"]) if row is not None else None
+    finally:
+        await connection.close()
+
+
+async def list_pending_ideas() -> list[tuple[int, str, str, str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT ideas.id, ideas.title, ideas.description,
+                   ideas.target_group, classes.name AS class_name
+            FROM ideas
+            JOIN classes ON classes.id = ideas.author_class_id
+            WHERE ideas.status = 'pending'
+            ORDER BY ideas.created_at, ideas.id
+            """
+        )
+        return [
+            (row["id"], row["title"], row["description"], row["target_group"], row["class_name"])
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
+async def moderate_idea(
+    idea_id: int,
+    moderator_id: int,
+    decision: str,
+    comment: str | None = None,
+) -> tuple[bool, str | None]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                """
+                SELECT id, author_class_id, status
+                FROM ideas
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                idea_id,
+            )
+            if row is None or row["status"] != "pending":
+                return False, None
+
+            if decision == "approved":
+                await connection.execute(
+                    """
+                    UPDATE ideas
+                    SET status = 'approved', moderator_comment = $2, updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    idea_id,
+                    comment,
+                )
+                await connection.execute(
+                    "UPDATE classes SET points = points + 10 WHERE id = $1",
+                    row["author_class_id"],
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO points_log (class_id, reason, points, confirmed_by)
+                    VALUES ($1, $2, 10, $3)
+                    """,
+                    row["author_class_id"],
+                    f"Идея №{idea_id} прошла модерацию",
+                    moderator_id,
+                )
+                return True, "approved"
+
+            await connection.execute(
+                """
+                UPDATE ideas
+                SET status = 'rejected', moderator_comment = $2, updated_at = NOW()
+                WHERE id = $1
+                """,
+                idea_id,
+                comment,
+            )
+            return True, "rejected"
     finally:
         await connection.close()
 

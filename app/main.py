@@ -7,10 +7,13 @@ from db import (
     create_idea,
     ensure_user_role,
     get_admin_ids,
+    get_moderator_ids,
     get_setting_text,
     get_user_class,
     initialize_database,
     list_classes_with_codes,
+    list_pending_ideas,
+    moderate_idea,
     set_setting,
 )
 from classes import SCHOOL_CLASSES, format_rating
@@ -69,7 +72,10 @@ async def admin_message(message: MessageCreated) -> None:
         "Команды:\n"
         "/setvalue Текст ценности месяца\n"
         "/addclass Название|группа|код\n"
-        "/classes — список классов и кодов"
+        "/classes — список классов и кодов\n"
+        "/ideas — очередь идей\n"
+        "/approve Номер\n"
+        "/reject Номер Комментарий"
     )
 
 
@@ -236,6 +242,62 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer("Не удалось добавить класс: имя или код уже используются.")
             return
         await message.answer(f"Класс {parts[0]} добавлен. Код: {parts[2].upper()}")
+        return
+
+    is_moderator = message.user_id is not None and (
+        message.user_id in get_admin_ids() or message.user_id in get_moderator_ids()
+    )
+
+    if text == "/ideas":
+        if not is_moderator:
+            await message.answer("У вас нет прав модератора.")
+            return
+        ideas = await list_pending_ideas()
+        if not ideas:
+            await message.answer("Очередь идей пуста.")
+            return
+        lines = ["📝 Идеи на модерации:"]
+        for idea_id, title, description, target_group, class_name in ideas:
+            lines.append(
+                f"\n№{idea_id} от класса {class_name}\n"
+                f"{title}\n{description}\nДля: {target_group}"
+            )
+        await message.answer("\n".join(lines))
+        return
+
+    if text == "/approve" or text.startswith("/approve "):
+        if not is_moderator:
+            await message.answer("У вас нет прав модератора.")
+            return
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].isdigit():
+            await message.answer("Формат: /approve Номер")
+            return
+        changed, status = await moderate_idea(int(parts[1]), message.user_id, "approved")
+        if not changed:
+            await message.answer("Идея не найдена или уже обработана.")
+            return
+        await message.answer("Идея одобрена. Классу начислено 10 баллов.")
+        return
+
+    if text == "/reject" or text.startswith("/reject "):
+        if not is_moderator:
+            await message.answer("У вас нет прав модератора.")
+            return
+        parts = text.split(maxsplit=2)
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].strip():
+            await message.answer("Формат: /reject Номер Причина отклонения")
+            return
+        changed, status = await moderate_idea(
+            int(parts[1]),
+            message.user_id,
+            "rejected",
+            parts[2].strip(),
+        )
+        if not changed:
+            await message.answer("Идея не найдена или уже обработана.")
+            return
+        await message.answer("Идея отклонена. Комментарий сохранён.")
         return
 
     if text == "💡 Подать идею":

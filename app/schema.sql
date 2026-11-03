@@ -22,12 +22,15 @@ CREATE TABLE IF NOT EXISTS ideas (
     description TEXT NOT NULL,
     target_group TEXT NOT NULL,
     author_class_id BIGINT NOT NULL REFERENCES classes(id),
+    author_user_id BIGINT,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'approved', 'rejected', 'needs_revision')),
     moderator_comment TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE ideas ADD COLUMN IF NOT EXISTS author_user_id BIGINT;
 
 CREATE TABLE IF NOT EXISTS events (
     id BIGSERIAL PRIMARY KEY,
