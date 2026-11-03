@@ -3,10 +3,14 @@ import os
 
 from db import (
     bind_user_to_class,
+    create_class,
     ensure_user_role,
     get_admin_ids,
+    get_setting_text,
     get_user_class,
     initialize_database,
+    list_classes_with_codes,
+    set_setting,
 )
 from classes import SCHOOL_CLASSES, format_rating
 from maxo import Bot, Dispatcher
@@ -59,7 +63,11 @@ async def admin_message(message: MessageCreated) -> None:
     await ensure_user_role(message.user_id, "admin")
     await message.answer(
         "⚙️ Панель администратора\n"
-        "Роль подтверждена на стороне сервера. Команды настройки добавим следующим этапом."
+        "Роль подтверждена на стороне сервера.\n\n"
+        "Команды:\n"
+        "/setvalue Текст ценности месяца\n"
+        "/addclass Название|группа|код\n"
+        "/classes — список классов и кодов"
     )
 
 
@@ -124,6 +132,56 @@ async def echo_handler(message: MessageCreated) -> None:
 
     if text == "⚙️ Администрирование":
         await admin_message(message)
+        return
+
+    if text == "🎯 Ценность месяца":
+        value = await get_setting_text("monthly_value", "Взаимопомощь")
+        await message.answer(
+            f"🎯 Ценность месяца: {value}",
+            keyboard=main_keyboard(message.user_id in get_admin_ids()),
+        )
+        return
+
+    if text == "/classes":
+        if message.user_id not in get_admin_ids():
+            await message.answer("У вас нет прав администратора.")
+            return
+        classes = await list_classes_with_codes()
+        lines = ["📚 Классы и коды приглашения:"]
+        lines.extend(f"• {name} ({age_group}) — {code}" for name, age_group, code in classes)
+        await message.answer("\n".join(lines))
+        return
+
+    if text == "/setvalue" or text.startswith("/setvalue "):
+        if message.user_id not in get_admin_ids():
+            await message.answer("У вас нет прав администратора.")
+            return
+        value = text.removeprefix("/setvalue").strip()
+        if not value:
+            await message.answer("Формат: /setvalue Текст ценности месяца")
+            return
+        await ensure_user_role(message.user_id, "admin")
+        await set_setting("monthly_value", value)
+        await message.answer(f"Ценность месяца изменена: {value}")
+        return
+
+    if text == "/addclass" or text.startswith("/addclass "):
+        if message.user_id not in get_admin_ids():
+            await message.answer("У вас нет прав администратора.")
+            return
+        payload = text.removeprefix("/addclass").strip()
+        parts = [part.strip() for part in payload.split("|")]
+        if len(parts) != 3 or parts[1] not in {"1-4", "5-8", "9-11"}:
+            await message.answer(
+                "Формат: /addclass Название|группа|код\n"
+                "Пример: /addclass 11А|9-11|AKTIV-11A"
+            )
+            return
+        created = await create_class(parts[0], parts[1], parts[2])
+        if not created:
+            await message.answer("Не удалось добавить класс: имя или код уже используются.")
+            return
+        await message.answer(f"Класс {parts[0]} добавлен. Код: {parts[2].upper()}")
         return
 
     menu_messages = {

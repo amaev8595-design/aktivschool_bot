@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 from pathlib import Path
 
@@ -105,6 +106,76 @@ async def ensure_user_role(max_user_id: int, role: str) -> None:
             max_user_id,
             role,
         )
+    finally:
+        await connection.close()
+
+
+async def get_setting_text(key: str, default: str) -> str:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow("SELECT value FROM settings WHERE key = $1", key)
+        if row is None:
+            return default
+        value = row["value"]
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+                return str(decoded)
+            except json.JSONDecodeError:
+                return value
+        return str(value)
+    finally:
+        await connection.close()
+
+
+async def set_setting(key: str, value: str) -> None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await connection.execute(
+            """
+            INSERT INTO settings (key, value, updated_at)
+            VALUES ($1, $2::jsonb, NOW())
+            ON CONFLICT (key)
+            DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+            """,
+            key,
+            json.dumps(value, ensure_ascii=False),
+        )
+    finally:
+        await connection.close()
+
+
+async def create_class(name: str, age_group: str, invite_code: str) -> bool:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        try:
+            await connection.execute(
+                """
+                INSERT INTO classes (name, age_group, invite_code)
+                VALUES ($1, $2, $3)
+                """,
+                name,
+                age_group,
+                invite_code.upper(),
+            )
+        except asyncpg.UniqueViolationError:
+            return False
+        return True
+    finally:
+        await connection.close()
+
+
+async def list_classes_with_codes() -> list[tuple[str, str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT name, age_group, invite_code
+            FROM classes
+            ORDER BY age_group, name
+            """
+        )
+        return [(row["name"], row["age_group"], row["invite_code"]) for row in rows]
     finally:
         await connection.close()
 
