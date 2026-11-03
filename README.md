@@ -37,6 +37,8 @@ docker compose down
 - `/addevent Название|Описание|YYYY-MM-DD|Класс`
 - `/classes`
 - `/events`
+- `/users`
+- `/setrole ID moderator|teacher|student`
 
 Кнопка «🎪 Афиша» показывает одобренные мероприятия. Участник с привязанным
 классом может записать класс командой `/signup Номер мероприятия`.

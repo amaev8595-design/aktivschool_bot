@@ -12,6 +12,7 @@ from db import (
     get_admin_ids,
     get_moderator_ids,
     get_setting_text,
+    get_user_role,
     get_user_class,
     initialize_database,
     list_classes_with_codes,
@@ -19,8 +20,10 @@ from db import (
     list_pending_reports,
     list_pending_ideas,
     list_rating,
+    list_users,
     moderate_idea,
     moderate_report,
+    set_user_role,
     set_setting,
     signup_for_event,
 )
@@ -66,6 +69,22 @@ def main_keyboard(is_admin: bool = False):
     return keyboard.adjust(2, 2).build()
 
 
+async def is_admin_user(user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    if user_id in get_admin_ids():
+        return True
+    return await get_user_role(user_id) == "admin"
+
+
+async def is_moderator_user(user_id: int | None) -> bool:
+    if user_id is None:
+        return False
+    if user_id in get_admin_ids() or user_id in get_moderator_ids():
+        return True
+    return await get_user_role(user_id) in {"admin", "moderator"}
+
+
 @dispatcher.message_created(Command("myid"))
 async def my_id_handler(message: MessageCreated) -> None:
     if message.user_id is None:
@@ -78,7 +97,7 @@ async def my_id_handler(message: MessageCreated) -> None:
 
 
 async def admin_message(message: MessageCreated) -> None:
-    if message.user_id is None or message.user_id not in get_admin_ids():
+    if not await is_admin_user(message.user_id):
         await message.answer("У вас нет прав администратора.")
         return
     await ensure_user_role(message.user_id, "admin")
@@ -90,6 +109,8 @@ async def admin_message(message: MessageCreated) -> None:
         "/addclass Название|группа|код\n"
         "/addevent Название|Описание|YYYY-MM-DD|Класс\n"
         "/classes — список классов и кодов\n"
+        "/users — список пользователей и ролей\n"
+        "/setrole ID moderator|teacher|student\n"
         "/events — список мероприятий\n"
         "/signup Номер — запись класса\n"
         "/report Номер|Комментарий — отправить отчёт\n"
@@ -114,7 +135,7 @@ async def start_handler(message: MessageCreated) -> None:
         await message.answer("Не удалось определить пользователя MAX. Попробуйте ещё раз.")
         return
 
-    is_admin = user_id in get_admin_ids()
+    is_admin = await is_admin_user(user_id)
     if is_admin:
         await ensure_user_role(user_id, "admin")
         await message.answer(
@@ -150,7 +171,7 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_ideas.pop(message.user_id, None)
         await message.answer(
             "Текущий сценарий отменён.",
-            keyboard=main_keyboard(message.user_id in get_admin_ids()),
+            keyboard=main_keyboard(await is_admin_user(message.user_id)),
         )
         return
 
@@ -193,7 +214,7 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer(
                 f"Идея №{idea_id} отправлена на модерацию.\n"
                 "Решение модератора появится в уведомлениях.",
-                keyboard=main_keyboard(message.user_id in get_admin_ids()),
+                keyboard=main_keyboard(await is_admin_user(message.user_id)),
             )
             return
 
@@ -221,12 +242,12 @@ async def echo_handler(message: MessageCreated) -> None:
         value = await get_setting_text("monthly_value", "Взаимопомощь")
         await message.answer(
             f"🎯 Ценность месяца: {value}",
-            keyboard=main_keyboard(message.user_id in get_admin_ids()),
+            keyboard=main_keyboard(await is_admin_user(message.user_id)),
         )
         return
 
     if text == "/classes":
-        if message.user_id not in get_admin_ids():
+        if not await is_admin_user(message.user_id):
             await message.answer("У вас нет прав администратора.")
             return
         classes = await list_classes_with_codes()
@@ -235,8 +256,44 @@ async def echo_handler(message: MessageCreated) -> None:
         await message.answer("\n".join(lines))
         return
 
+    if text == "/users":
+        if not await is_admin_user(message.user_id):
+            await message.answer("У вас нет прав администратора.")
+            return
+        users = await list_users()
+        if not users:
+            await message.answer("Пользователей пока нет.")
+            return
+        lines = ["👥 Пользователи и роли:"]
+        for max_user_id, role, class_name in users:
+            lines.append(
+                f"{max_user_id} — {role} — класс: {class_name or 'не привязан'}"
+            )
+        await message.answer("\n".join(lines))
+        return
+
+    if text == "/setrole" or text.startswith("/setrole "):
+        if not await is_admin_user(message.user_id):
+            await message.answer("У вас нет прав администратора.")
+            return
+        parts = text.split()
+        allowed_roles = {"student", "teacher", "moderator"}
+        if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in allowed_roles:
+            await message.answer(
+                "Формат: /setrole ID moderator|teacher|student\n"
+                "Пример: /setrole 123456 moderator"
+            )
+            return
+        target_id = int(parts[1])
+        if target_id in get_admin_ids():
+            await message.answer("Пользователь из ADMIN_IDS не может быть понижен этой командой.")
+            return
+        await set_user_role(target_id, parts[2])
+        await message.answer(f"Для пользователя {target_id} назначена роль: {parts[2]}.")
+        return
+
     if text == "/setvalue" or text.startswith("/setvalue "):
-        if message.user_id not in get_admin_ids():
+        if not await is_admin_user(message.user_id):
             await message.answer("У вас нет прав администратора.")
             return
         value = text.removeprefix("/setvalue").strip()
@@ -249,7 +306,7 @@ async def echo_handler(message: MessageCreated) -> None:
         return
 
     if text == "/addclass" or text.startswith("/addclass "):
-        if message.user_id not in get_admin_ids():
+        if not await is_admin_user(message.user_id):
             await message.answer("У вас нет прав администратора.")
             return
         payload = text.removeprefix("/addclass").strip()
@@ -268,7 +325,7 @@ async def echo_handler(message: MessageCreated) -> None:
         return
 
     if text == "/addevent" or text.startswith("/addevent "):
-        if message.user_id not in get_admin_ids():
+        if not await is_admin_user(message.user_id):
             await message.answer("У вас нет прав администратора.")
             return
         payload = text.removeprefix("/addevent").strip()
@@ -309,7 +366,10 @@ async def echo_handler(message: MessageCreated) -> None:
                 f"Организатор: класс {class_name}\n"
                 f"Запись класса: /signup {event_id}"
             )
-        await message.answer("\n".join(lines), keyboard=main_keyboard(message.user_id in get_admin_ids()))
+        await message.answer(
+            "\n".join(lines),
+            keyboard=main_keyboard(await is_admin_user(message.user_id)),
+        )
         return
 
     if text == "/signup" or text.startswith("/signup "):
@@ -369,9 +429,7 @@ async def echo_handler(message: MessageCreated) -> None:
         )
         return
 
-    is_moderator = message.user_id is not None and (
-        message.user_id in get_admin_ids() or message.user_id in get_moderator_ids()
-    )
+    is_moderator = await is_moderator_user(message.user_id)
 
     if text == "/ideas":
         if not is_moderator:
@@ -482,7 +540,10 @@ async def echo_handler(message: MessageCreated) -> None:
         lines = ["🏆 Рейтинг классов:"]
         for position, (name, age_group, points) in enumerate(rating, start=1):
             lines.append(f"{position}. {name} ({age_group}) — {points} баллов")
-        await message.answer("\n".join(lines), keyboard=main_keyboard(message.user_id in get_admin_ids()))
+        await message.answer(
+            "\n".join(lines),
+            keyboard=main_keyboard(await is_admin_user(message.user_id)),
+        )
         return
 
     if text == "💡 Подать идею":

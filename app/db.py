@@ -120,6 +120,54 @@ async def ensure_user_role(max_user_id: int, role: str) -> None:
         await connection.close()
 
 
+async def get_user_role(max_user_id: int) -> str | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            "SELECT role FROM users WHERE max_user_id = $1",
+            max_user_id,
+        )
+        return row["role"] if row is not None else None
+    finally:
+        await connection.close()
+
+
+async def set_user_role(max_user_id: int, role: str) -> None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await connection.execute(
+            """
+            INSERT INTO users (max_user_id, role)
+            VALUES ($1, $2)
+            ON CONFLICT (max_user_id)
+            DO UPDATE SET role = EXCLUDED.role
+            """,
+            max_user_id,
+            role,
+        )
+    finally:
+        await connection.close()
+
+
+async def list_users() -> list[tuple[int, str, str | None]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT users.max_user_id, users.role, classes.name AS class_name
+            FROM users
+            LEFT JOIN classes ON classes.id = users.class_id
+            ORDER BY users.created_at, users.max_user_id
+            """
+        )
+        return [
+            (row["max_user_id"], row["role"], row["class_name"])
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
 async def get_setting_text(key: str, default: str) -> str:
     connection = await asyncpg.connect(get_database_url())
     try:
