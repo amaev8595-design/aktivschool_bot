@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+from datetime import date
 from pathlib import Path
 
 import asyncpg
@@ -185,6 +186,97 @@ async def list_classes_with_codes() -> list[tuple[str, str, str]]:
             """
         )
         return [(row["name"], row["age_group"], row["invite_code"]) for row in rows]
+    finally:
+        await connection.close()
+
+
+async def create_event(
+    title: str,
+    description: str,
+    event_date: date,
+    author_class_name: str,
+) -> int | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            "SELECT id FROM classes WHERE name = $1",
+            author_class_name,
+        )
+        if row is None:
+            return None
+
+        event = await connection.fetchrow(
+            """
+            INSERT INTO events (title, description, event_date, author_class_id, status)
+            VALUES ($1, $2, $3, $4, 'approved')
+            RETURNING id
+            """,
+            title,
+            description,
+            event_date,
+            row["id"],
+        )
+        return int(event["id"])
+    finally:
+        await connection.close()
+
+
+async def list_events() -> list[tuple[int, str, str, str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT events.id, events.title, events.description,
+                   events.event_date, classes.name AS class_name
+            FROM events
+            JOIN classes ON classes.id = events.author_class_id
+            WHERE events.status = 'approved'
+            ORDER BY events.event_date, events.id
+            """
+        )
+        return [
+            (
+                row["id"],
+                row["title"],
+                row["description"],
+                row["event_date"].isoformat(),
+                row["class_name"],
+            )
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
+async def signup_for_event(max_user_id: int, event_id: int) -> str:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        user = await connection.fetchrow(
+            "SELECT class_id FROM users WHERE max_user_id = $1",
+            max_user_id,
+        )
+        if user is None or user["class_id"] is None:
+            return "not_bound"
+
+        event = await connection.fetchrow(
+            "SELECT id FROM events WHERE id = $1 AND status = 'approved'",
+            event_id,
+        )
+        if event is None:
+            return "not_found"
+
+        try:
+            await connection.execute(
+                """
+                INSERT INTO event_signups (event_id, class_id)
+                VALUES ($1, $2)
+                """,
+                event_id,
+                user["class_id"],
+            )
+        except asyncpg.UniqueViolationError:
+            return "already"
+        return "ok"
     finally:
         await connection.close()
 

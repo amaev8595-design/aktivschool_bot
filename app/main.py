@@ -1,10 +1,12 @@
 import asyncio
 import os
+from datetime import date
 
 from db import (
     bind_user_to_class,
     create_class,
     create_idea,
+    create_event,
     ensure_user_role,
     get_admin_ids,
     get_moderator_ids,
@@ -12,9 +14,11 @@ from db import (
     get_user_class,
     initialize_database,
     list_classes_with_codes,
+    list_events,
     list_pending_ideas,
     moderate_idea,
     set_setting,
+    signup_for_event,
 )
 from classes import SCHOOL_CLASSES, format_rating
 from maxo import Bot, Dispatcher
@@ -72,7 +76,10 @@ async def admin_message(message: MessageCreated) -> None:
         "Команды:\n"
         "/setvalue Текст ценности месяца\n"
         "/addclass Название|группа|код\n"
+        "/addevent Название|Описание|YYYY-MM-DD|Класс\n"
         "/classes — список классов и кодов\n"
+        "/events — список мероприятий\n"
+        "/signup Номер — запись класса\n"
         "/ideas — очередь идей\n"
         "/approve Номер\n"
         "/reject Номер Комментарий"
@@ -244,6 +251,66 @@ async def echo_handler(message: MessageCreated) -> None:
         await message.answer(f"Класс {parts[0]} добавлен. Код: {parts[2].upper()}")
         return
 
+    if text == "/addevent" or text.startswith("/addevent "):
+        if message.user_id not in get_admin_ids():
+            await message.answer("У вас нет прав администратора.")
+            return
+        payload = text.removeprefix("/addevent").strip()
+        parts = [part.strip() for part in payload.split("|")]
+        if len(parts) != 4 or not all(parts):
+            await message.answer(
+                "Формат: /addevent Название|Описание|YYYY-MM-DD|Класс\n"
+                "Пример: /addevent Квест благодарности|Командная игра|2026-11-08|9А"
+            )
+            return
+        try:
+            event_date = date.fromisoformat(parts[2])
+        except ValueError:
+            await message.answer("Дата должна быть в формате YYYY-MM-DD, например 2026-11-08.")
+            return
+        event_id = await create_event(parts[0], parts[1], event_date, parts[3])
+        if event_id is None:
+            await message.answer("Класс не найден. Сначала проверьте список командой /classes.")
+            return
+        await message.answer(
+            f"Мероприятие №{event_id} добавлено в афишу.\n"
+            "Пользователи увидят его через кнопку «🎪 Афиша»."
+        )
+        return
+
+    if text == "/events" or text == "🎪 Афиша":
+        events = await list_events()
+        if not events:
+            await message.answer(
+                "🎪 Афиша пока пуста. Администратор может добавить мероприятие командой /addevent."
+            )
+            return
+        lines = ["🎪 Афиша мероприятий:"]
+        for event_id, title, description, event_date, class_name in events:
+            lines.append(
+                f"\n№{event_id} · {event_date} · {title}\n"
+                f"{description}\n"
+                f"Организатор: класс {class_name}\n"
+                f"Запись класса: /signup {event_id}"
+            )
+        await message.answer("\n".join(lines), keyboard=main_keyboard(message.user_id in get_admin_ids()))
+        return
+
+    if text == "/signup" or text.startswith("/signup "):
+        parts = text.split(maxsplit=1)
+        if message.user_id is None or len(parts) != 2 or not parts[1].isdigit():
+            await message.answer("Формат: /signup Номер мероприятия")
+            return
+        result = await signup_for_event(message.user_id, int(parts[1]))
+        responses = {
+            "not_bound": "Сначала привяжите пользователя к классу через /start.",
+            "not_found": "Мероприятие не найдено или уже недоступно.",
+            "already": "Ваш класс уже записан на это мероприятие.",
+            "ok": "Готово! Ваш класс записан на мероприятие.",
+        }
+        await message.answer(responses[result])
+        return
+
     is_moderator = message.user_id is not None and (
         message.user_id in get_admin_ids() or message.user_id in get_moderator_ids()
     )
@@ -314,7 +381,6 @@ async def echo_handler(message: MessageCreated) -> None:
     menu_messages = {
         "🎯 Ценность месяца": "🎯 Ценность месяца — Взаимопомощь.\nНастройку этого значения подключим к базе данных.",
         "🏆 Рейтинг": format_rating(SCHOOL_CLASSES),
-        "🎪 Афиша": "🎪 Афиша пока пуста. Одобренные идеи будут появляться здесь.",
         "💡 Подать идею": "💡 Форма подачи идеи будет добавлена следующим этапом.",
     }
 
