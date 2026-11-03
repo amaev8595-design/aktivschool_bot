@@ -281,7 +281,12 @@ async def signup_for_event(max_user_id: int, event_id: int) -> str:
         await connection.close()
 
 
-async def create_report(max_user_id: int, event_id: int, comment: str) -> tuple[str, int | None]:
+async def create_report(
+    max_user_id: int,
+    event_id: int,
+    comment: str | None,
+    media_token: str | None = None,
+) -> tuple[str, int | None]:
     connection = await asyncpg.connect(get_database_url())
     try:
         user = await connection.fetchrow(
@@ -308,12 +313,13 @@ async def create_report(max_user_id: int, event_id: int, comment: str) -> tuple[
 
         report = await connection.fetchrow(
             """
-            INSERT INTO reports (event_id, class_id, comment)
-            VALUES ($1, $2, $3)
+            INSERT INTO reports (event_id, class_id, media_token, comment)
+            VALUES ($1, $2, $3, $4)
             RETURNING id
             """,
             event_id,
             user["class_id"],
+            media_token,
             comment,
         )
         return "ok", int(report["id"])

@@ -43,6 +43,15 @@ pending_class_code_users: set[int] = set()
 pending_ideas: dict[int, dict[str, str]] = {}
 
 
+def media_tokens(message: MessageCreated) -> str | None:
+    tokens: list[str] = []
+    for attachment in message.message.body.photo:
+        tokens.append(attachment.payload.token)
+    for attachment in message.message.body.video:
+        tokens.append(attachment.payload.token)
+    return ",".join(tokens) if tokens else None
+
+
 def main_keyboard(is_admin: bool = False):
     keyboard = (
         KeyboardBuilder()
@@ -324,16 +333,29 @@ async def echo_handler(message: MessageCreated) -> None:
             return
         payload = text.removeprefix("/report").strip()
         parts = [part.strip() for part in payload.split("|", maxsplit=1)]
-        if len(parts) != 2 or not parts[0].isdigit() or not parts[1]:
+        attachment_token = media_tokens(message)
+        if (
+            len(parts) not in {1, 2}
+            or not parts[0].isdigit()
+            or (len(parts) == 1 and not attachment_token)
+            or (len(parts) == 2 and not parts[1] and not attachment_token)
+        ):
             await message.answer(
                 "Формат: /report Номер мероприятия|Комментарий\n"
-                "Пример: /report 1|Провели мероприятие, участвовали 18 учеников."
+                "Пример: /report 1|Провели мероприятие, участвовали 18 учеников.\n"
+                "Фото или видео можно прикрепить к этому же сообщению."
             )
             return
-        if len(parts[1]) > 2000:
+        comment = parts[1] if len(parts) == 2 and parts[1] else None
+        if comment and len(comment) > 2000:
             await message.answer("Комментарий отчёта должен быть не длиннее 2000 символов.")
             return
-        result, report_id = await create_report(message.user_id, int(parts[0]), parts[1])
+        result, report_id = await create_report(
+            message.user_id,
+            int(parts[0]),
+            comment,
+            attachment_token,
+        )
         responses = {
             "not_bound": "Сначала привяжите пользователя к классу через /start.",
             "not_signed": "Ваш класс не записан на это мероприятие.",
@@ -341,7 +363,10 @@ async def echo_handler(message: MessageCreated) -> None:
         if result != "ok":
             await message.answer(responses[result])
             return
-        await message.answer(f"Отчёт №{report_id} отправлен на проверку модератору.")
+        media_note = " Фото/видео сохранено." if attachment_token else ""
+        await message.answer(
+            f"Отчёт №{report_id} отправлен на проверку модератору.{media_note}"
+        )
         return
 
     is_moderator = message.user_id is not None and (
