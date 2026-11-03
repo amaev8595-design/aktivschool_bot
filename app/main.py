@@ -5,6 +5,7 @@ from db import initialize_database
 from maxo import Bot, Dispatcher
 from maxo.routing.filters import CommandStart
 from maxo.types import MessageCreated
+from maxo.utils.builders import KeyboardBuilder
 
 
 def required_env(name: str) -> str:
@@ -18,17 +19,42 @@ bot = Bot(required_env("MAX_BOT_TOKEN"))
 dispatcher = Dispatcher()
 
 
+def main_keyboard():
+    return (
+        KeyboardBuilder()
+        .add_message(text="🎯 Ценность месяца")
+        .add_message(text="🏆 Рейтинг")
+        .add_message(text="🎪 Афиша")
+        .add_message(text="💡 Подать идею")
+        .adjust(2, 2)
+        .build()
+    )
+
+
 @dispatcher.message_created(CommandStart())
 async def start_handler(message: MessageCreated) -> None:
     await message.answer(
         "Привет! Это бот проекта «Актив».\n"
-        "Пока работает тестовый режим."
+        "Выберите раздел меню:",
+        keyboard=main_keyboard(),
     )
 
 
 @dispatcher.message_created()
 async def echo_handler(message: MessageCreated) -> None:
     text = message.text or "Сообщение получено, но в нём нет текста."
+
+    menu_messages = {
+        "🎯 Ценность месяца": "🎯 Ценность месяца — Взаимопомощь.\nНастройку этого значения подключим к базе данных.",
+        "🏆 Рейтинг": "🏆 Рейтинг пока заполняется. На следующем шаге подключим классы и баллы.",
+        "🎪 Афиша": "🎪 Афиша пока пуста. Одобренные идеи будут появляться здесь.",
+        "💡 Подать идею": "💡 Форма подачи идеи будет добавлена следующим этапом.",
+    }
+
+    if text in menu_messages:
+        await message.answer(menu_messages[text], keyboard=main_keyboard())
+        return
+
     await message.answer(f"Вы написали: {text}")
 
 
