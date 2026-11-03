@@ -281,6 +281,162 @@ async def signup_for_event(max_user_id: int, event_id: int) -> str:
         await connection.close()
 
 
+async def create_report(max_user_id: int, event_id: int, comment: str) -> tuple[str, int | None]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        user = await connection.fetchrow(
+            "SELECT class_id FROM users WHERE max_user_id = $1",
+            max_user_id,
+        )
+        if user is None or user["class_id"] is None:
+            return "not_bound", None
+
+        signup = await connection.fetchrow(
+            """
+            SELECT event_signups.id
+            FROM event_signups
+            JOIN events ON events.id = event_signups.event_id
+            WHERE event_signups.event_id = $1
+              AND event_signups.class_id = $2
+              AND events.status = 'approved'
+            """,
+            event_id,
+            user["class_id"],
+        )
+        if signup is None:
+            return "not_signed", None
+
+        report = await connection.fetchrow(
+            """
+            INSERT INTO reports (event_id, class_id, comment)
+            VALUES ($1, $2, $3)
+            RETURNING id
+            """,
+            event_id,
+            user["class_id"],
+            comment,
+        )
+        return "ok", int(report["id"])
+    finally:
+        await connection.close()
+
+
+async def list_pending_reports() -> list[tuple[int, int, str, str, str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT reports.id, events.id AS event_id, events.title,
+                   classes.name AS class_name,
+                   COALESCE(reports.comment, '') AS comment,
+                   COALESCE(reports.media_token, '') AS media_token
+            FROM reports
+            JOIN events ON events.id = reports.event_id
+            JOIN classes ON classes.id = reports.class_id
+            WHERE reports.status = 'pending'
+            ORDER BY reports.created_at, reports.id
+            """
+        )
+        return [
+            (
+                row["id"],
+                row["event_id"],
+                row["title"],
+                row["class_name"],
+                row["comment"],
+                row["media_token"],
+            )
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
+async def moderate_report(
+    report_id: int,
+    moderator_max_user_id: int,
+    decision: str,
+    comment: str | None = None,
+) -> tuple[bool, str | None]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                """
+                SELECT id, class_id, status
+                FROM reports
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                report_id,
+            )
+            if row is None or row["status"] != "pending":
+                return False, None
+
+            if decision == "approved":
+                await connection.execute(
+                    """
+                    UPDATE reports
+                    SET status = 'approved', checked_by = (
+                            SELECT id FROM users WHERE max_user_id = $2
+                        ),
+                        checked_at = NOW(), comment = COALESCE($3, comment)
+                    WHERE id = $1
+                    """,
+                    report_id,
+                    moderator_max_user_id,
+                    comment,
+                )
+                await connection.execute(
+                    "UPDATE classes SET points = points + 5 WHERE id = $1",
+                    row["class_id"],
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO points_log (class_id, reason, points, confirmed_by)
+                    VALUES ($1, $2, 5, (
+                        SELECT id FROM users WHERE max_user_id = $3
+                    ))
+                    """,
+                    row["class_id"],
+                    f"Отчёт №{report_id} подтверждён",
+                    moderator_max_user_id,
+                )
+                return True, "approved"
+
+            await connection.execute(
+                """
+                UPDATE reports
+                SET status = 'rejected', checked_by = (
+                        SELECT id FROM users WHERE max_user_id = $2
+                    ),
+                    checked_at = NOW(), comment = COALESCE($3, comment)
+                WHERE id = $1
+                """,
+                report_id,
+                moderator_max_user_id,
+                comment,
+            )
+            return True, "rejected"
+    finally:
+        await connection.close()
+
+
+async def list_rating() -> list[tuple[str, str, int]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT name, age_group, points
+            FROM classes
+            ORDER BY points DESC, age_group, name
+            """
+        )
+        return [(row["name"], row["age_group"], row["points"]) for row in rows]
+    finally:
+        await connection.close()
+
+
 async def create_idea(
     max_user_id: int,
     title: str,
@@ -366,7 +522,9 @@ async def moderate_idea(
                 await connection.execute(
                     """
                     INSERT INTO points_log (class_id, reason, points, confirmed_by)
-                    VALUES ($1, $2, 10, $3)
+                    VALUES ($1, $2, 10, (
+                        SELECT id FROM users WHERE max_user_id = $3
+                    ))
                     """,
                     row["author_class_id"],
                     f"Идея №{idea_id} прошла модерацию",

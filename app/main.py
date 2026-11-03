@@ -7,6 +7,7 @@ from db import (
     create_class,
     create_idea,
     create_event,
+    create_report,
     ensure_user_role,
     get_admin_ids,
     get_moderator_ids,
@@ -15,12 +16,14 @@ from db import (
     initialize_database,
     list_classes_with_codes,
     list_events,
+    list_pending_reports,
     list_pending_ideas,
+    list_rating,
     moderate_idea,
+    moderate_report,
     set_setting,
     signup_for_event,
 )
-from classes import SCHOOL_CLASSES, format_rating
 from maxo import Bot, Dispatcher
 from maxo.routing.filters import Command, CommandStart
 from maxo.types import MessageCreated
@@ -80,6 +83,10 @@ async def admin_message(message: MessageCreated) -> None:
         "/classes — список классов и кодов\n"
         "/events — список мероприятий\n"
         "/signup Номер — запись класса\n"
+        "/report Номер|Комментарий — отправить отчёт\n"
+        "/reports — очередь отчётов\n"
+        "/approve_report Номер\n"
+        "/reject_report Номер Причина\n"
         "/ideas — очередь идей\n"
         "/approve Номер\n"
         "/reject Номер Комментарий"
@@ -311,6 +318,32 @@ async def echo_handler(message: MessageCreated) -> None:
         await message.answer(responses[result])
         return
 
+    if text == "/report" or text.startswith("/report "):
+        if message.user_id is None:
+            await message.answer("Не удалось определить пользователя MAX.")
+            return
+        payload = text.removeprefix("/report").strip()
+        parts = [part.strip() for part in payload.split("|", maxsplit=1)]
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1]:
+            await message.answer(
+                "Формат: /report Номер мероприятия|Комментарий\n"
+                "Пример: /report 1|Провели мероприятие, участвовали 18 учеников."
+            )
+            return
+        if len(parts[1]) > 2000:
+            await message.answer("Комментарий отчёта должен быть не длиннее 2000 символов.")
+            return
+        result, report_id = await create_report(message.user_id, int(parts[0]), parts[1])
+        responses = {
+            "not_bound": "Сначала привяжите пользователя к классу через /start.",
+            "not_signed": "Ваш класс не записан на это мероприятие.",
+        }
+        if result != "ok":
+            await message.answer(responses[result])
+            return
+        await message.answer(f"Отчёт №{report_id} отправлен на проверку модератору.")
+        return
+
     is_moderator = message.user_id is not None and (
         message.user_id in get_admin_ids() or message.user_id in get_moderator_ids()
     )
@@ -367,6 +400,66 @@ async def echo_handler(message: MessageCreated) -> None:
         await message.answer("Идея отклонена. Комментарий сохранён.")
         return
 
+    if text == "/reports":
+        if not is_moderator:
+            await message.answer("У вас нет прав модератора.")
+            return
+        reports = await list_pending_reports()
+        if not reports:
+            await message.answer("Очередь отчётов пуста.")
+            return
+        lines = ["📋 Отчёты на проверке:"]
+        for report_id, event_id, title, class_name, comment, media_token in reports:
+            lines.append(
+                f"\nОтчёт №{report_id}, мероприятие №{event_id}: {title}\n"
+                f"Класс: {class_name}\n{comment}"
+                + ("\nПрикреплён медиа-файл." if media_token else "")
+            )
+        await message.answer("\n".join(lines))
+        return
+
+    if text == "/approve_report" or text.startswith("/approve_report "):
+        if not is_moderator:
+            await message.answer("У вас нет прав модератора.")
+            return
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].isdigit():
+            await message.answer("Формат: /approve_report Номер отчёта")
+            return
+        changed, status = await moderate_report(
+            int(parts[1]), message.user_id, "approved"
+        )
+        if not changed:
+            await message.answer("Отчёт не найден или уже обработан.")
+            return
+        await message.answer("Отчёт подтверждён. Классу начислено 5 баллов.")
+        return
+
+    if text == "/reject_report" or text.startswith("/reject_report "):
+        if not is_moderator:
+            await message.answer("У вас нет прав модератора.")
+            return
+        parts = text.split(maxsplit=2)
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].strip():
+            await message.answer("Формат: /reject_report Номер Причина отклонения")
+            return
+        changed, status = await moderate_report(
+            int(parts[1]), message.user_id, "rejected", parts[2].strip()
+        )
+        if not changed:
+            await message.answer("Отчёт не найден или уже обработан.")
+            return
+        await message.answer("Отчёт отклонён. Комментарий сохранён.")
+        return
+
+    if text == "🏆 Рейтинг":
+        rating = await list_rating()
+        lines = ["🏆 Рейтинг классов:"]
+        for position, (name, age_group, points) in enumerate(rating, start=1):
+            lines.append(f"{position}. {name} ({age_group}) — {points} баллов")
+        await message.answer("\n".join(lines), keyboard=main_keyboard(message.user_id in get_admin_ids()))
+        return
+
     if text == "💡 Подать идею":
         if message.user_id is None or await get_user_class(message.user_id) is None:
             await message.answer("Сначала привяжите пользователя к классу через /start.")
@@ -380,7 +473,6 @@ async def echo_handler(message: MessageCreated) -> None:
 
     menu_messages = {
         "🎯 Ценность месяца": "🎯 Ценность месяца — Взаимопомощь.\nНастройку этого значения подключим к базе данных.",
-        "🏆 Рейтинг": format_rating(SCHOOL_CLASSES),
         "💡 Подать идею": "💡 Форма подачи идеи будет добавлена следующим этапом.",
     }
 
