@@ -55,8 +55,10 @@ CREATE TABLE IF NOT EXISTS reports (
     id BIGSERIAL PRIMARY KEY,
     event_id BIGINT NOT NULL REFERENCES events(id),
     class_id BIGINT NOT NULL REFERENCES classes(id),
+    submitted_by_max_user_id BIGINT,
     media_token TEXT,
     comment TEXT,
+    moderator_comment TEXT,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'approved', 'rejected')),
     checked_by BIGINT REFERENCES users(id),
@@ -64,6 +66,17 @@ CREATE TABLE IF NOT EXISTS reports (
     checked_at TIMESTAMPTZ,
     CHECK (media_token IS NOT NULL OR comment IS NOT NULL)
 );
+
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS submitted_by_max_user_id BIGINT;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS moderator_comment TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS reports_event_user_unique
+    ON reports (event_id, submitted_by_max_user_id)
+    WHERE submitted_by_max_user_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS reports_event_class_unique
+    ON reports (event_id, class_id)
+    WHERE status IN ('pending', 'approved');
 
 CREATE TABLE IF NOT EXISTS points_log (
     id BIGSERIAL PRIMARY KEY,

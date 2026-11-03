@@ -168,6 +168,20 @@ async def list_users() -> list[tuple[int, str, str | None]]:
         await connection.close()
 
 
+async def list_user_ids_by_roles(roles: set[str]) -> list[int]:
+    if not roles:
+        return []
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            "SELECT max_user_id FROM users WHERE role = ANY($1::text[])",
+            list(roles),
+        )
+        return [row["max_user_id"] for row in rows]
+    finally:
+        await connection.close()
+
+
 async def get_setting_text(key: str, default: str) -> str:
     connection = await asyncpg.connect(get_database_url())
     try:
@@ -296,6 +310,37 @@ async def list_events() -> list[tuple[int, str, str, str, str]]:
         await connection.close()
 
 
+async def list_signed_up_events(max_user_id: int) -> list[tuple[int, str, str, str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT events.id, events.title, events.description,
+                   events.event_date, classes.name AS class_name
+            FROM users
+            JOIN event_signups ON event_signups.class_id = users.class_id
+            JOIN events ON events.id = event_signups.event_id
+            JOIN classes ON classes.id = events.author_class_id
+            WHERE users.max_user_id = $1
+              AND events.status = 'approved'
+            ORDER BY events.event_date, events.id
+            """,
+            max_user_id,
+        )
+        return [
+            (
+                row["id"],
+                row["title"],
+                row["description"],
+                row["event_date"].isoformat(),
+                row["class_name"],
+            )
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
 async def signup_for_event(max_user_id: int, event_id: int) -> str:
     connection = await asyncpg.connect(get_database_url())
     try:
@@ -359,18 +404,158 @@ async def create_report(
         if signup is None:
             return "not_signed", None
 
+        existing = await connection.fetchrow(
+            """
+            SELECT id, status
+            FROM reports
+            WHERE event_id = $1 AND class_id = $2
+            ORDER BY id
+            LIMIT 1
+            FOR UPDATE
+            """,
+            event_id,
+            user["class_id"],
+        )
+        if existing is not None:
+            if existing["status"] == "rejected":
+                return "rejected_exists", int(existing["id"])
+            return "class_already_reported", int(existing["id"])
+
         report = await connection.fetchrow(
             """
-            INSERT INTO reports (event_id, class_id, media_token, comment)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO reports (
+                event_id, class_id, submitted_by_max_user_id, media_token, comment
+            )
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING id
             """,
             event_id,
             user["class_id"],
+            max_user_id,
             media_token,
             comment,
         )
         return "ok", int(report["id"])
+    except asyncpg.UniqueViolationError:
+        return "class_already_reported", None
+    finally:
+        await connection.close()
+
+
+async def get_class_report(
+    max_user_id: int,
+    event_id: int,
+) -> tuple[int, str, int | None, str] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT reports.id, reports.status,
+                   reports.submitted_by_max_user_id,
+                   COALESCE(reports.moderator_comment, '') AS moderator_comment
+            FROM reports
+            JOIN users ON users.class_id = reports.class_id
+            WHERE users.max_user_id = $1
+              AND reports.event_id = $2
+            ORDER BY reports.id
+            LIMIT 1
+            """,
+            max_user_id,
+            event_id,
+        )
+        if row is None:
+            return None
+        return (
+            int(row["id"]),
+            row["status"],
+            int(row["submitted_by_max_user_id"])
+            if row["submitted_by_max_user_id"] is not None
+            else None,
+            row["moderator_comment"],
+        )
+    finally:
+        await connection.close()
+
+
+async def revise_report(
+    max_user_id: int,
+    event_id: int,
+    comment: str | None,
+    media_token: str | None = None,
+) -> tuple[str, int | None]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        user = await connection.fetchrow(
+            "SELECT class_id FROM users WHERE max_user_id = $1",
+            max_user_id,
+        )
+        if user is None or user["class_id"] is None:
+            return "not_bound", None
+
+        signup = await connection.fetchrow(
+            """
+            SELECT event_signups.id
+            FROM event_signups
+            JOIN events ON events.id = event_signups.event_id
+            WHERE event_signups.event_id = $1
+              AND event_signups.class_id = $2
+              AND events.status = 'approved'
+            """,
+            event_id,
+            user["class_id"],
+        )
+        if signup is None:
+            return "not_signed", None
+
+        report = await connection.fetchrow(
+            """
+            SELECT id, status, submitted_by_max_user_id
+            FROM reports
+            WHERE event_id = $1 AND class_id = $2
+            ORDER BY id
+            LIMIT 1
+            FOR UPDATE
+            """,
+            event_id,
+            user["class_id"],
+        )
+        if report is None:
+            return "not_found", None
+        if report["status"] != "rejected":
+            return "class_already_reported", int(report["id"])
+        if report["submitted_by_max_user_id"] != max_user_id:
+            return "not_report_author", int(report["id"])
+
+        await connection.execute(
+            """
+            UPDATE reports
+            SET media_token = $2,
+                comment = $3,
+                status = 'pending',
+                checked_by = NULL,
+                checked_at = NULL,
+                moderator_comment = NULL
+            WHERE id = $1
+            """,
+            report["id"],
+            media_token,
+            comment,
+        )
+        return "ok", int(report["id"])
+    finally:
+        await connection.close()
+
+
+async def get_report_submitter_id(report_id: int) -> int | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            "SELECT submitted_by_max_user_id FROM reports WHERE id = $1",
+            report_id,
+        )
+        if row is None or row["submitted_by_max_user_id"] is None:
+            return None
+        return int(row["submitted_by_max_user_id"])
     finally:
         await connection.close()
 
@@ -411,7 +596,7 @@ async def moderate_report(
     moderator_max_user_id: int,
     decision: str,
     comment: str | None = None,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, int | None]:
     connection = await asyncpg.connect(get_database_url())
     try:
         async with connection.transaction():
@@ -425,16 +610,26 @@ async def moderate_report(
                 report_id,
             )
             if row is None or row["status"] != "pending":
-                return False, None
+                return False, None, None
 
             if decision == "approved":
+                points_row = await connection.fetchrow(
+                    """
+                    SELECT COALESCE((
+                        SELECT (value->>'participation')::int
+                        FROM settings WHERE key = 'points_scale'
+                    ), 5) AS points
+                    """
+                )
+                points = points_row["points"]
                 await connection.execute(
                     """
                     UPDATE reports
                     SET status = 'approved', checked_by = (
                             SELECT id FROM users WHERE max_user_id = $2
                         ),
-                        checked_at = NOW(), comment = COALESCE($3, comment)
+                        checked_at = NOW(),
+                        moderator_comment = COALESCE($3, moderator_comment)
                     WHERE id = $1
                     """,
                     report_id,
@@ -442,21 +637,23 @@ async def moderate_report(
                     comment,
                 )
                 await connection.execute(
-                    "UPDATE classes SET points = points + 5 WHERE id = $1",
+                    "UPDATE classes SET points = points + $2 WHERE id = $1",
                     row["class_id"],
+                    points,
                 )
                 await connection.execute(
                     """
                     INSERT INTO points_log (class_id, reason, points, confirmed_by)
-                    VALUES ($1, $2, 5, (
+                    VALUES ($1, $2, $4, (
                         SELECT id FROM users WHERE max_user_id = $3
                     ))
                     """,
                     row["class_id"],
                     f"Отчёт №{report_id} подтверждён",
                     moderator_max_user_id,
+                    points,
                 )
-                return True, "approved"
+                return True, "approved", points
 
             await connection.execute(
                 """
@@ -464,14 +661,15 @@ async def moderate_report(
                 SET status = 'rejected', checked_by = (
                         SELECT id FROM users WHERE max_user_id = $2
                     ),
-                    checked_at = NOW(), comment = COALESCE($3, comment)
+                    checked_at = NOW(),
+                    moderator_comment = $3
                 WHERE id = $1
                 """,
                 report_id,
                 moderator_max_user_id,
                 comment,
             )
-            return True, "rejected"
+            return True, "rejected", None
     finally:
         await connection.close()
 
@@ -491,28 +689,109 @@ async def list_rating() -> list[tuple[str, str, int]]:
         await connection.close()
 
 
+async def get_class_place(max_user_id: int) -> tuple[int, str, str, int] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            """
+            WITH ranked_classes AS (
+                SELECT id, name, age_group, points,
+                       RANK() OVER (ORDER BY points DESC) AS place
+                FROM classes
+            )
+            SELECT ranked_classes.place, ranked_classes.name,
+                   ranked_classes.age_group, ranked_classes.points
+            FROM users
+            JOIN ranked_classes ON ranked_classes.id = users.class_id
+            WHERE users.max_user_id = $1
+            """,
+            max_user_id,
+        )
+        if row is None:
+            return None
+        return row["place"], row["name"], row["age_group"], row["points"]
+    finally:
+        await connection.close()
+
+
+async def get_class_team(max_user_id: int) -> tuple[str, str, int] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT classes.name, classes.age_group, COUNT(users.id) AS member_count
+            FROM users AS selected_user
+            JOIN classes ON classes.id = selected_user.class_id
+            LEFT JOIN users ON users.class_id = classes.id
+            WHERE selected_user.max_user_id = $1
+            GROUP BY classes.id, classes.name, classes.age_group
+            """,
+            max_user_id,
+        )
+        if row is None:
+            return None
+        return row["name"], row["age_group"], row["member_count"]
+    finally:
+        await connection.close()
+
+
+async def get_idea_author_id(idea_id: int) -> int | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            "SELECT author_user_id FROM ideas WHERE id = $1",
+            idea_id,
+        )
+        return row["author_user_id"] if row is not None else None
+    finally:
+        await connection.close()
+
+
 async def create_idea(
     max_user_id: int,
     title: str,
     description: str,
     target_group: str,
-) -> int | None:
+) -> tuple[str, int | None]:
     connection = await asyncpg.connect(get_database_url())
     try:
-        row = await connection.fetchrow(
-            """
-            INSERT INTO ideas (title, description, target_group, author_class_id, author_user_id)
-            SELECT $1, $2, $3, class_id, $4
-            FROM users
-            WHERE max_user_id = $4 AND class_id IS NOT NULL
-            RETURNING id
-            """,
-            title,
-            description,
-            target_group,
-            max_user_id,
-        )
-        return int(row["id"]) if row is not None else None
+        async with connection.transaction():
+            user = await connection.fetchrow(
+                "SELECT class_id FROM users WHERE max_user_id = $1",
+                max_user_id,
+            )
+            if user is None or user["class_id"] is None:
+                return "not_bound", None
+
+            limit_row = await connection.fetchrow(
+                """
+                SELECT COUNT(*) AS idea_count,
+                       COALESCE((
+                           SELECT (value #>> '{}')::int
+                           FROM settings WHERE key = 'class_idea_limit'
+                       ), 3) AS idea_limit
+                FROM ideas
+                WHERE author_class_id = $1
+                  AND created_at >= date_trunc('month', NOW())
+                """,
+                user["class_id"],
+            )
+            if limit_row["idea_count"] >= limit_row["idea_limit"]:
+                return "limit", None
+
+            row = await connection.fetchrow(
+                """
+                INSERT INTO ideas (title, description, target_group, author_class_id, author_user_id)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+                """,
+                title,
+                description,
+                target_group,
+                user["class_id"],
+                max_user_id,
+            )
+            return "ok", int(row["id"])
     finally:
         await connection.close()
 
@@ -543,13 +822,14 @@ async def moderate_idea(
     moderator_id: int,
     decision: str,
     comment: str | None = None,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, int | None]:
     connection = await asyncpg.connect(get_database_url())
     try:
         async with connection.transaction():
             row = await connection.fetchrow(
                 """
                 SELECT id, author_class_id, status
+                       , title, description, target_group, author_user_id
                 FROM ideas
                 WHERE id = $1
                 FOR UPDATE
@@ -557,9 +837,35 @@ async def moderate_idea(
                 idea_id,
             )
             if row is None or row["status"] != "pending":
-                return False, None
+                return False, None, None
 
             if decision == "approved":
+                limit_row = await connection.fetchrow(
+                    """
+                    SELECT COUNT(*) AS approved_count,
+                           COALESCE((
+                               SELECT (value #>> '{}')::int
+                               FROM settings WHERE key = 'monthly_approval_limit'
+                           ), 5) AS approval_limit
+                    FROM ideas
+                    WHERE author_class_id = $1
+                      AND status = 'approved'
+                      AND created_at >= date_trunc('month', NOW())
+                    """,
+                    row["author_class_id"],
+                )
+                if limit_row["approved_count"] >= limit_row["approval_limit"]:
+                    return False, "limit", None
+
+                points_row = await connection.fetchrow(
+                    """
+                    SELECT COALESCE((
+                        SELECT (value->>'approved_idea')::int
+                        FROM settings WHERE key = 'points_scale'
+                    ), 10) AS points
+                    """
+                )
+                points = points_row["points"]
                 await connection.execute(
                     """
                     UPDATE ideas
@@ -570,21 +876,33 @@ async def moderate_idea(
                     comment,
                 )
                 await connection.execute(
-                    "UPDATE classes SET points = points + 10 WHERE id = $1",
+                    "UPDATE classes SET points = points + $2 WHERE id = $1",
                     row["author_class_id"],
+                    points,
                 )
                 await connection.execute(
                     """
                     INSERT INTO points_log (class_id, reason, points, confirmed_by)
-                    VALUES ($1, $2, 10, (
+                    VALUES ($1, $2, $4, (
                         SELECT id FROM users WHERE max_user_id = $3
                     ))
                     """,
                     row["author_class_id"],
                     f"Идея №{idea_id} прошла модерацию",
                     moderator_id,
+                    points,
                 )
-                return True, "approved"
+                event = await connection.fetchrow(
+                    """
+                    INSERT INTO events (title, description, event_date, author_class_id, status)
+                    VALUES ($1, $2, CURRENT_DATE + 7, $3, 'approved')
+                    RETURNING id
+                    """,
+                    row["title"],
+                    f"{row['description']}\nЦелевая группа: {row['target_group']}",
+                    row["author_class_id"],
+                )
+                return True, "approved", int(event["id"])
 
             await connection.execute(
                 """
@@ -595,7 +913,48 @@ async def moderate_idea(
                 idea_id,
                 comment,
             )
-            return True, "rejected"
+            return True, "rejected", None
+    finally:
+        await connection.close()
+
+
+async def award_prize(class_name: str, place: int, confirmer_id: int) -> tuple[bool, int | None]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            class_row = await connection.fetchrow(
+                "SELECT id FROM classes WHERE name = $1",
+                class_name,
+            )
+            if class_row is None:
+                return False, None
+            points_row = await connection.fetchrow(
+                """
+                SELECT COALESCE((
+                    SELECT (value->>'prize_place')::int
+                    FROM settings WHERE key = 'points_scale'
+                ), 15) AS points
+                """
+            )
+            points = points_row["points"]
+            await connection.execute(
+                "UPDATE classes SET points = points + $2 WHERE id = $1",
+                class_row["id"],
+                points,
+            )
+            await connection.execute(
+                """
+                INSERT INTO points_log (class_id, reason, points, confirmed_by)
+                VALUES ($1, $2, $3, (
+                    SELECT id FROM users WHERE max_user_id = $4
+                ))
+                """,
+                class_row["id"],
+                f"Призовое место: {place}",
+                points,
+                confirmer_id,
+            )
+            return True, points
     finally:
         await connection.close()
 
