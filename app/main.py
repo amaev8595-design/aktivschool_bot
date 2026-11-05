@@ -12,10 +12,14 @@ from db import (
     create_idea,
     create_event,
     create_report,
+    create_teacher_application,
+    create_teacher_invite,
     ensure_user_role,
     get_admin_ids,
     get_class_report,
     get_moderator_ids,
+    get_teacher_application,
+    get_teacher_invite,
     get_setting_text,
     get_idea_author_id,
     get_class_place,
@@ -27,13 +31,16 @@ from db import (
     list_classes_with_codes,
     list_events,
     list_pending_reports,
+    list_pending_teacher_applications,
     list_pending_ideas,
     list_rating,
     list_signed_up_events,
+    list_teacher_invites,
     list_user_ids_by_roles,
     list_users,
     moderate_idea,
     moderate_report,
+    moderate_teacher_application,
     revise_report,
     set_user_role,
     set_setting,
@@ -41,13 +48,20 @@ from db import (
 )
 from maxo import Bot, Dispatcher
 from maxo.routing.filters import Command, CommandStart
-from maxo.types import MessageCreated
+from maxo.types import BotStarted, MessageCreated
 from maxo.transport.webhook.adapters.fastapi import FastApiWebAdapter
 from maxo.transport.webhook.engines.simple import SimpleEngine
 from maxo.transport.webhook.routing.static import StaticRouting
 from maxo.transport.webhook.security.secret_token import StaticSecretToken
 from maxo.utils.builders import KeyboardBuilder
 import uvicorn
+
+
+class CompatibleStaticSecretToken(StaticSecretToken):
+    """Compatibility shim for maxo 0.9.1 webhook startup."""
+
+    async def get_secret_token(self, bot: Bot) -> str:
+        return self.secret_token(bot)
 
 
 def required_env(name: str) -> str:
@@ -66,6 +80,7 @@ pending_admin_forms: dict[int, dict[str, str]] = {}
 pending_event_selection_users: set[int] = set()
 pending_report_selection_users: set[int] = set()
 pending_user_reports: dict[int, dict[str, str]] = {}
+pending_teacher_forms: dict[int, dict[str, str]] = {}
 BOT_MODE = os.getenv("BOT_MODE", "polling").strip().lower()
 
 
@@ -100,11 +115,22 @@ def main_keyboard(is_admin: bool = False):
         .add_message(text="💡 Подать идею")
         .add_message(text="📍 Место")
         .add_message(text="👥 Команда")
+        .add_message(text="ℹ️ Инструкция")
+        .add_message(text="▶️ Старт")
     )
     if is_admin:
         keyboard.add_message(text="⚙️ Администрирование")
-        return keyboard.adjust(2, 2, 1).build()
-    return keyboard.adjust(2, 2).build()
+        return keyboard.adjust(2, 2, 2, 2, 1).build()
+    return keyboard.adjust(2, 2, 2, 1).build()
+
+
+def registration_keyboard():
+    return options_keyboard(
+        "👨‍🎓 Регистрация ученика",
+        "👩‍🏫 Регистрация учителя",
+        "ℹ️ Инструкция",
+        "▶️ Старт",
+    )
 
 
 def admin_keyboard():
@@ -119,15 +145,19 @@ def admin_keyboard():
         .add_message(text="🎪 Мероприятия")
         .add_message(text="💡 Очередь идей")
         .add_message(text="📋 Очередь отчётов")
+        .add_message(text="👩‍🏫 Заявки учителей")
+        .add_message(text="🔑 Коды учителей")
         .add_message(text="✅ Одобрить идею")
         .add_message(text="❌ Отклонить идею")
+        .add_message(text="✅ Одобрить заявку")
+        .add_message(text="❌ Отклонить заявку")
         .add_message(text="✅ Одобрить отчёт")
         .add_message(text="❌ Отклонить отчёт")
         .add_message(text="🏅 Призовые баллы")
         .add_message(text="⚙️ Лимиты")
         .add_message(text="↩️ Главное меню")
     )
-    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2).build()
+    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2).build()
 
 
 def class_group_keyboard():
@@ -166,6 +196,10 @@ def report_actions_keyboard():
     return options_keyboard("✅ Одобрить отчёт", "❌ Отклонить отчёт")
 
 
+def teacher_application_actions_keyboard():
+    return options_keyboard("✅ Одобрить заявку", "❌ Отклонить заявку")
+
+
 def report_confirmation_keyboard(confirm_label: str):
     return options_keyboard(confirm_label, "↩️ Отмена")
 
@@ -184,6 +218,12 @@ def context_keyboard(context: str):
         ),
         "idea": options_keyboard("✅ Одобрить идею", "❌ Отклонить идею"),
         "report": report_actions_keyboard(),
+        "teacher": teacher_application_actions_keyboard(),
+        "teacher_codes": options_keyboard(
+            "🔑 Создать код учителя",
+            "🔑 Коды учителей",
+            "↩️ Администрирование",
+        ),
         "award": options_keyboard("🏅 Призовые баллы", "↩️ Администрирование"),
         "limit": options_keyboard("⚙️ Лимиты", "↩️ Администрирование"),
     }
@@ -247,6 +287,14 @@ async def is_moderator_user(user_id: int | None) -> bool:
     return await get_user_role(user_id) in {"admin", "moderator"}
 
 
+async def entry_keyboard(user_id: int | None):
+    is_admin = await is_admin_user(user_id)
+    user_class = await get_user_class(user_id) if user_id is not None else None
+    if is_admin or user_class is not None:
+        return main_keyboard(is_admin)
+    return registration_keyboard()
+
+
 @dispatcher.message_created(Command("myid"))
 async def my_id_handler(message: MessageCreated) -> None:
     if message.user_id is None:
@@ -276,39 +324,60 @@ async def admin_command_handler(message: MessageCreated) -> None:
     await admin_message(message)
 
 
+async def start_screen(user_id: int) -> tuple[str, object]:
+    is_admin = await is_admin_user(user_id)
+    if is_admin:
+        await ensure_user_role(user_id, "admin")
+        return (
+            "Привет! Вы вошли как администратор проекта «Актив».\n"
+            "Выберите раздел меню:",
+            main_keyboard(is_admin=True),
+        )
+
+    user_class = await get_user_class(user_id)
+    if user_class is None:
+        application = await get_teacher_application(user_id)
+        if application is not None and application[1] == "pending":
+            return (
+                "Ваша заявка на регистрацию учителя уже отправлена. "
+                "Ожидайте подтверждения администратора.",
+                registration_keyboard(),
+            )
+        if application is not None and application[1] == "rejected":
+            reason = application[4] or "Причина не указана."
+            return (
+                f"Заявка на регистрацию учителя отклонена.\nПричина: {reason}\n"
+                "Можно подать новую заявку.",
+                registration_keyboard(),
+            )
+        return (
+            "Добро пожаловать в «Актив»!\n"
+            "Выберите тип регистрации:",
+            registration_keyboard(),
+        )
+
+    return (
+        f"Привет! Вы привязаны к классу {user_class[0]} ({user_class[1]}).\n"
+        "Выберите раздел меню:",
+        main_keyboard(),
+    )
+
+
+@dispatcher.bot_started()
+async def bot_started_handler(update: BotStarted) -> None:
+    user_id = update.user.user_id
+    text, keyboard = await start_screen(user_id)
+    await bot.send_message(user_id=user_id, text=text, keyboard=keyboard)
+
+
 @dispatcher.message_created(CommandStart())
 async def start_handler(message: MessageCreated) -> None:
     user_id = message.user_id
     if user_id is None:
         await message.answer("Не удалось определить пользователя MAX. Попробуйте ещё раз.")
         return
-
-    is_admin = await is_admin_user(user_id)
-    if is_admin:
-        await ensure_user_role(user_id, "admin")
-        await message.answer(
-            "Привет! Вы вошли как администратор проекта «Актив».\n"
-            "Выберите раздел меню:",
-            keyboard=main_keyboard(is_admin=True),
-        )
-        return
-
-    user_class = await get_user_class(user_id)
-    if user_class is None:
-        pending_class_code_users.add(user_id)
-        await message.answer(
-            "Добро пожаловать в «Актив»!\n"
-            "Введите код приглашения вашего класса.\n"
-            "Для демонстрации используйте код AKTIV-9A.",
-            keyboard=cancel_keyboard(),
-        )
-        return
-
-    await message.answer(
-        f"Привет! Вы привязаны к классу {user_class[0]} ({user_class[1]}).\n"
-        "Выберите раздел меню:",
-        keyboard=main_keyboard(),
-    )
+    text, keyboard = await start_screen(user_id)
+    await message.answer(text, keyboard=keyboard)
 
 
 @dispatcher.message_created()
@@ -324,9 +393,57 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_event_selection_users.discard(message.user_id)
         pending_report_selection_users.discard(message.user_id)
         pending_user_reports.pop(message.user_id, None)
+        pending_teacher_forms.pop(message.user_id, None)
         await message.answer(
             "Текущий сценарий отменён.",
-            keyboard=main_keyboard(await is_admin_user(message.user_id)),
+            keyboard=await entry_keyboard(message.user_id),
+        )
+        return
+
+    if text == "ℹ️ Инструкция":
+        is_admin = await is_admin_user(message.user_id)
+        user_class = await get_user_class(message.user_id) if message.user_id is not None else None
+        await message.answer(
+            "ℹ️ Краткая инструкция\n\n"
+            "👨‍🎓 Ученик: выберите регистрацию ученика и введите код класса.\n"
+            "👩‍🏫 Учитель: заполните заявку и используйте персональный код, "
+            "выданный администратором.\n"
+            "🎪 Афиша — запись класса на мероприятия.\n"
+            "📋 Подать отчёт — отправка одного отчёта от класса за мероприятие.\n"
+            "💡 Подать идею — предложить новое мероприятие.\n\n"
+            "Для возврата используйте кнопку «▶️ Старт».",
+            keyboard=main_keyboard(is_admin) if is_admin or user_class is not None else registration_keyboard(),
+        )
+        return
+
+    if text == "▶️ Старт":
+        pending_class_code_users.discard(message.user_id)
+        pending_ideas.pop(message.user_id, None)
+        pending_admin_actions.pop(message.user_id, None)
+        pending_admin_forms.pop(message.user_id, None)
+        pending_event_selection_users.discard(message.user_id)
+        pending_report_selection_users.discard(message.user_id)
+        pending_user_reports.pop(message.user_id, None)
+        pending_teacher_forms.pop(message.user_id, None)
+        await start_handler(message)
+        return
+
+    if text == "👨‍🎓 Регистрация ученика":
+        pending_teacher_forms.pop(message.user_id, None)
+        pending_class_code_users.add(message.user_id)
+        await message.answer(
+            "Введите код приглашения вашего класса.\n"
+            "Для демонстрации используется код AKTIV-9A.",
+            keyboard=cancel_keyboard(),
+        )
+        return
+
+    if text == "👩‍🏫 Регистрация учителя":
+        pending_class_code_users.discard(message.user_id)
+        pending_teacher_forms[message.user_id] = {"step": "full_name"}
+        await message.answer(
+            "Шаг 1 из 3. Введите ФИО учителя.",
+            keyboard=cancel_keyboard(),
         )
         return
 
@@ -408,13 +525,116 @@ async def echo_handler(message: MessageCreated) -> None:
         )
         return
 
+    if message.user_id in pending_teacher_forms:
+        form = pending_teacher_forms[message.user_id]
+        value = text.strip()
+
+        if form["step"] == "full_name":
+            if len(value) < 2 or len(value) > 120:
+                await message.answer("Укажите ФИО длиной от 2 до 120 символов.")
+                return
+            form["full_name"] = value
+            form["step"] = "subject"
+            await message.answer(
+                "Шаг 2 из 3. Введите предмет или должность, например: математика.",
+                keyboard=cancel_keyboard(),
+            )
+            return
+
+        if form["step"] == "subject":
+            if len(value) < 2 or len(value) > 100:
+                await message.answer("Предмет должен содержать от 2 до 100 символов.")
+                return
+            form["subject"] = value
+            form["step"] = "invite_code"
+            await message.answer(
+                "Шаг 3 из 3. Введите персональный код учителя, выданный администратором.",
+                keyboard=cancel_keyboard(),
+            )
+            return
+
+        if form["step"] == "invite_code":
+            invite = await get_teacher_invite(value)
+            if invite is None:
+                await message.answer(
+                    "Код не найден, уже использован или отозван. Проверьте код и отправьте его ещё раз.",
+                    keyboard=cancel_keyboard(),
+                )
+                return
+            form["invite_code"] = value.upper()
+            form["class_name"] = invite[2]
+            form["step"] = "confirm"
+            await message.answer(
+                f"ФИО: {form['full_name']}\n"
+                f"Предмет: {form['subject']}\n"
+                f"Класс: {form['class_name']}\n\n"
+                "Отправить заявку администратору?",
+                keyboard=confirmation_keyboard("✅ Отправить заявку"),
+            )
+            return
+
+        if form["step"] == "confirm":
+            if value == "✏️ Изменить":
+                form["step"] = "full_name"
+                await message.answer("Введите ФИО учителя заново.", keyboard=cancel_keyboard())
+                return
+            if value != "✅ Отправить заявку":
+                await message.answer(
+                    "Нажмите «✅ Отправить заявку» или «✏️ Изменить».",
+                    keyboard=confirmation_keyboard("✅ Отправить заявку"),
+                )
+                return
+            result, application_id, class_name = await create_teacher_application(
+                message.user_id,
+                form["full_name"],
+                form["subject"],
+                form["invite_code"],
+            )
+            pending_teacher_forms.pop(message.user_id, None)
+            if result == "already_pending":
+                await message.answer(
+                    "Ваша заявка уже находится на проверке.",
+                    keyboard=registration_keyboard(),
+                )
+                return
+            if result == "already_approved":
+                await message.answer(
+                    "Ваша заявка уже одобрена.",
+                    keyboard=main_keyboard(await is_admin_user(message.user_id)),
+                )
+                return
+            if result == "invite_in_use":
+                await message.answer(
+                    "Этот код уже используется в другой заявке. Получите новый код у администратора.",
+                    keyboard=registration_keyboard(),
+                )
+                return
+            if result != "ok":
+                await message.answer(
+                    "Код учителя больше недействителен. Получите новый код у администратора.",
+                    keyboard=registration_keyboard(),
+                )
+                return
+            await notify_moderators(
+                f"👩‍🏫 Новая заявка учителя №{application_id}.\n"
+                f"ФИО: {form['full_name']}\n"
+                f"Предмет: {form['subject']}\n"
+                f"Класс: {class_name}\n"
+                "Откройте раздел «👩‍🏫 Заявки учителей»."
+            )
+            await message.answer(
+                "Заявка отправлена администратору. Ожидайте подтверждения.",
+                keyboard=registration_keyboard(),
+            )
+            return
+
     if message.user_id in pending_admin_forms:
         form = pending_admin_forms[message.user_id]
         value = text.strip()
 
         if value == "↩️ Отмена":
             pending_admin_forms.pop(message.user_id, None)
-            await message.answer("Добавление класса отменено.", keyboard=context_keyboard("class"))
+            await message.answer("Текущая форма отменена.", keyboard=admin_keyboard())
             return
 
         if form.get("kind") == "addclass" and form["step"] == "name":
@@ -500,6 +720,34 @@ async def echo_handler(message: MessageCreated) -> None:
             return
 
         kind = form["kind"]
+
+        if kind == "teacher_invite":
+            if form["step"] == "class":
+                classes = await list_classes_with_codes()
+                class_names = {name for name, _age_group, _code in classes}
+                if value not in class_names:
+                    await message.answer(
+                        "Выберите класс кнопкой из списка.",
+                        keyboard=options_keyboard(*sorted(class_names), "↩️ Отмена"),
+                    )
+                    return
+                invite = await create_teacher_invite(value)
+                pending_admin_forms.pop(message.user_id, None)
+                if invite is None:
+                    await message.answer(
+                        "Класс не найден. Обновите список классов и попробуйте снова.",
+                        keyboard=context_keyboard("teacher_codes"),
+                    )
+                    return
+                code, class_name = invite
+                await message.answer(
+                    f"Код учителя создан для класса {class_name}:\n\n"
+                    f"{code}\n\n"
+                    "Передайте этот код учителю лично. Он одноразовый и не должен "
+                    "публиковаться в общем чате.",
+                    keyboard=context_keyboard("teacher_codes"),
+                )
+                return
 
         if kind == "setvalue":
             if form["step"] == "value":
@@ -634,13 +882,25 @@ async def echo_handler(message: MessageCreated) -> None:
                 )
                 return
 
-        elif kind in {"approve_idea", "approve_report"}:
-            command = "/approve" if kind == "approve_idea" else "/approve_report"
-            title = "идею" if kind == "approve_idea" else "отчёт"
+        elif kind in {"approve_idea", "approve_report", "approve_teacher"}:
+            command = {
+                "approve_idea": "/approve",
+                "approve_report": "/approve_report",
+                "approve_teacher": "/approve_teacher",
+            }[kind]
+            title = {
+                "approve_idea": "идею",
+                "approve_report": "отчёт",
+                "approve_teacher": "заявку учителя",
+            }[kind]
             confirm = (
                 "✅ Одобрить идею"
                 if kind == "approve_idea"
-                else "✅ Подтвердить одобрение"
+                else (
+                    "✅ Подтвердить одобрение заявки"
+                    if kind == "approve_teacher"
+                    else "✅ Подтвердить одобрение"
+                )
             )
             if form["step"] == "id":
                 if not value.isdigit():
@@ -652,7 +912,7 @@ async def echo_handler(message: MessageCreated) -> None:
                     f"Подтвердить одобрение: {title} №{value}?",
                     keyboard=(
                         report_confirmation_keyboard(confirm)
-                        if kind == "approve_report"
+                        if kind in {"approve_report", "approve_teacher"}
                         else confirmation_keyboard(confirm)
                     ),
                 )
@@ -668,24 +928,36 @@ async def echo_handler(message: MessageCreated) -> None:
                 await message.answer(
                     (
                         f"Нажмите «{confirm}»."
-                        if kind == "approve_report"
+                        if kind in {"approve_report", "approve_teacher"}
                         else f"Нажмите «{confirm}» или «✏️ Изменить»."
                     ),
                     keyboard=(
                         report_confirmation_keyboard(confirm)
-                        if kind == "approve_report"
+                        if kind in {"approve_report", "approve_teacher"}
                         else confirmation_keyboard(confirm)
                     ),
                 )
                 return
 
-        elif kind in {"reject_idea", "reject_report"}:
-            command = "/reject" if kind == "reject_idea" else "/reject_report"
-            title = "идею" if kind == "reject_idea" else "отчёт"
+        elif kind in {"reject_idea", "reject_report", "reject_teacher"}:
+            command = {
+                "reject_idea": "/reject",
+                "reject_report": "/reject_report",
+                "reject_teacher": "/reject_teacher",
+            }[kind]
+            title = {
+                "reject_idea": "идею",
+                "reject_report": "отчёт",
+                "reject_teacher": "заявку учителя",
+            }[kind]
             confirm = (
                 "❌ Отклонить идею"
                 if kind == "reject_idea"
-                else "❌ Подтвердить отклонение"
+                else (
+                    "❌ Подтвердить отклонение заявки"
+                    if kind == "reject_teacher"
+                    else "❌ Подтвердить отклонение"
+                )
             )
             if form["step"] == "id":
                 if not value.isdigit():
@@ -708,7 +980,7 @@ async def echo_handler(message: MessageCreated) -> None:
                     f"Отклонить {title} №{form['item_id']}?\nПричина: {value}",
                     keyboard=(
                         report_confirmation_keyboard(confirm)
-                        if kind == "reject_report"
+                        if kind in {"reject_report", "reject_teacher"}
                         else confirmation_keyboard(confirm)
                     ),
                 )
@@ -729,7 +1001,7 @@ async def echo_handler(message: MessageCreated) -> None:
                     ),
                     keyboard=(
                         report_confirmation_keyboard(confirm)
-                        if kind == "reject_report"
+                        if kind in {"reject_report", "reject_teacher"}
                         else confirmation_keyboard(confirm)
                     ),
                 )
@@ -1031,6 +1303,8 @@ async def echo_handler(message: MessageCreated) -> None:
         "🎪 Мероприятия",
         "💡 Очередь идей",
         "📋 Очередь отчётов",
+        "👩‍🏫 Заявки учителей",
+        "🔑 Коды учителей",
     }:
         if not await is_admin_user(message.user_id):
             await message.answer("У вас нет прав администратора.")
@@ -1043,6 +1317,8 @@ async def echo_handler(message: MessageCreated) -> None:
             "🎪 Мероприятия": "/events",
             "💡 Очередь идей": "/ideas",
             "📋 Очередь отчётов": "/reports",
+            "👩‍🏫 Заявки учителей": "/teacher_applications",
+            "🔑 Коды учителей": "/teacher_codes",
         }[text]
 
     elif text == "↩️ Главное меню":
@@ -1082,6 +1358,18 @@ async def echo_handler(message: MessageCreated) -> None:
             {"kind": "reject_report", "step": "id"},
             "Введите номер отчёта.",
         ),
+        "✅ Одобрить заявку": (
+            {"kind": "approve_teacher", "step": "id"},
+            "Введите номер заявки учителя.",
+        ),
+        "❌ Отклонить заявку": (
+            {"kind": "reject_teacher", "step": "id"},
+            "Введите номер заявки учителя.",
+        ),
+        "🔑 Создать код учителя": (
+            {"kind": "teacher_invite", "step": "class"},
+            "Выберите класс, для которого создать персональный код учителя:",
+        ),
         "🏅 Призовые баллы": (
             {"kind": "award", "step": "class"},
             "Введите название класса.",
@@ -1108,6 +1396,14 @@ async def echo_handler(message: MessageCreated) -> None:
             )
         elif text in {"✅ Одобрить отчёт", "❌ Отклонить отчёт"}:
             keyboard = cancel_keyboard()
+        elif text in {"✅ Одобрить заявку", "❌ Отклонить заявку"}:
+            keyboard = cancel_keyboard()
+        elif text == "🔑 Создать код учителя":
+            classes = await list_classes_with_codes()
+            keyboard = options_keyboard(
+                *(name for name, _age_group, _code in classes),
+                "↩️ Отмена",
+            )
         await message.answer(
             prompt + "\n\nДля отмены нажмите «↩️ Отмена».",
             keyboard=keyboard,
@@ -1148,6 +1444,106 @@ async def echo_handler(message: MessageCreated) -> None:
                 f"{max_user_id} — {role} — класс: {class_name or 'не привязан'}"
             )
         await message.answer("\n".join(lines), keyboard=context_keyboard("role"))
+        return
+
+    if text == "/teacher_codes":
+        if not await is_admin_user(message.user_id):
+            await message.answer("У вас нет прав администратора.")
+            return
+        invites = await list_teacher_invites()
+        if not invites:
+            await message.answer(
+                "Кодов учителей пока нет. Создайте персональный код для нужного класса.",
+                keyboard=context_keyboard("teacher_codes"),
+            )
+            return
+        status_labels = {
+            "active": "активен",
+            "used": "использован",
+            "revoked": "отозван",
+        }
+        lines = ["🔑 Коды учителей:"]
+        lines.extend(
+            f"{code} — класс {class_name} — {status_labels.get(status, status)}"
+            for code, class_name, status in invites
+        )
+        await message.answer("\n".join(lines), keyboard=context_keyboard("teacher_codes"))
+        return
+
+    if text == "/teacher_applications":
+        if not await is_admin_user(message.user_id):
+            await message.answer("У вас нет прав администратора.")
+            return
+        applications = await list_pending_teacher_applications()
+        if not applications:
+            await message.answer(
+                "Заявок учителей на проверке нет.",
+                keyboard=teacher_application_actions_keyboard(),
+            )
+            return
+        lines = ["👩‍🏫 Заявки учителей:"]
+        for application_id, max_user_id, full_name, subject, class_name in applications:
+            lines.append(
+                f"\nЗаявка №{application_id}\n"
+                f"ФИО: {full_name}\n"
+                f"Предмет: {subject}\n"
+                f"Класс: {class_name}\n"
+                f"MAX ID: {max_user_id}"
+            )
+        await message.answer("\n".join(lines), keyboard=teacher_application_actions_keyboard())
+        return
+
+    if text == "/approve_teacher" or text.startswith("/approve_teacher "):
+        if not await is_admin_user(message.user_id):
+            await message.answer("У вас нет прав администратора.")
+            return
+        parts = text.split(maxsplit=1)
+        if len(parts) != 2 or not parts[1].isdigit():
+            await message.answer("Формат: /approve_teacher Номер заявки")
+            return
+        changed, status, applicant_id, class_name = await moderate_teacher_application(
+            int(parts[1]), message.user_id, "approved"
+        )
+        if not changed:
+            await message.answer("Заявка не найдена или уже обработана.")
+            return
+        await message.answer(
+            f"Заявка одобрена. Учитель привязан к классу {class_name}.",
+            keyboard=teacher_application_actions_keyboard(),
+        )
+        if applicant_id is not None:
+            await notify_user(
+                applicant_id,
+                f"✅ Заявка на регистрацию учителя одобрена.\n"
+                f"Вы привязаны к классу {class_name}.",
+            )
+        return
+
+    if text == "/reject_teacher" or text.startswith("/reject_teacher "):
+        if not await is_admin_user(message.user_id):
+            await message.answer("У вас нет прав администратора.")
+            return
+        parts = text.split(maxsplit=2)
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].strip():
+            await message.answer("Формат: /reject_teacher Номер Причина")
+            return
+        changed, status, applicant_id, class_name = await moderate_teacher_application(
+            int(parts[1]), message.user_id, "rejected", parts[2].strip()
+        )
+        if not changed:
+            await message.answer("Заявка не найдена или уже обработана.")
+            return
+        await message.answer(
+            "Заявка отклонена. Причина сохранена.",
+            keyboard=teacher_application_actions_keyboard(),
+        )
+        if applicant_id is not None:
+            await notify_user(
+                applicant_id,
+                "❌ Заявка на регистрацию учителя отклонена.\n"
+                f"Причина: {parts[2].strip()}\n"
+                "Можно подать новую заявку.",
+            )
         return
 
     if text == "/setrole" or text.startswith("/setrole "):
@@ -1726,13 +2122,13 @@ def build_webhook_app() -> tuple[FastAPI | None, SimpleEngine | None]:
         bot,
         web_adapter=FastApiWebAdapter(),
         routing=StaticRouting(public_url),
-        security=StaticSecretToken(webhook_secret),
+        security=CompatibleStaticSecretToken(webhook_secret),
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await engine.on_startup(app)
-        await engine.set_webhook()
+        await engine.set_webhook(update_types=["message_created", "bot_started"])
         print(f"Webhook подключён: {public_url}")
         try:
             yield

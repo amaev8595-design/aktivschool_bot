@@ -16,6 +16,30 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS teacher_invites (
+    id BIGSERIAL PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'used', 'revoked')),
+    used_by_max_user_id BIGINT,
+    used_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS teacher_applications (
+    id BIGSERIAL PRIMARY KEY,
+    max_user_id BIGINT NOT NULL UNIQUE,
+    full_name TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    invite_id BIGINT NOT NULL REFERENCES teacher_invites(id),
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'approved', 'rejected')),
+    moderator_comment TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS ideas (
     id BIGSERIAL PRIMARY KEY,
     title TEXT NOT NULL,

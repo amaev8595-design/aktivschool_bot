@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import secrets
 from datetime import date
 from pathlib import Path
 
@@ -178,6 +179,297 @@ async def list_user_ids_by_roles(roles: set[str]) -> list[int]:
             list(roles),
         )
         return [row["max_user_id"] for row in rows]
+    finally:
+        await connection.close()
+
+
+async def create_teacher_invite(class_name: str) -> tuple[str, str] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        class_row = await connection.fetchrow(
+            "SELECT id, name FROM classes WHERE name = $1",
+            class_name.strip(),
+        )
+        if class_row is None:
+            return None
+
+        alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        for _ in range(10):
+            code = "AKTIV-T-" + "".join(secrets.choice(alphabet) for _ in range(6))
+            try:
+                await connection.execute(
+                    """
+                    INSERT INTO teacher_invites (code, class_id)
+                    VALUES ($1, $2)
+                    """,
+                    code,
+                    class_row["id"],
+                )
+                return code, class_row["name"]
+            except asyncpg.UniqueViolationError:
+                continue
+        raise RuntimeError("Не удалось сгенерировать уникальный код учителя")
+    finally:
+        await connection.close()
+
+
+async def list_teacher_invites() -> list[tuple[str, str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT teacher_invites.code, classes.name AS class_name,
+                   teacher_invites.status
+            FROM teacher_invites
+            JOIN classes ON classes.id = teacher_invites.class_id
+            ORDER BY teacher_invites.created_at DESC, teacher_invites.id DESC
+            """
+        )
+        return [
+            (row["code"], row["class_name"], row["status"])
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
+async def get_teacher_invite(code: str) -> tuple[int, int, str] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT teacher_invites.id, teacher_invites.class_id,
+                   classes.name AS class_name
+            FROM teacher_invites
+            JOIN classes ON classes.id = teacher_invites.class_id
+            WHERE teacher_invites.code = $1
+              AND teacher_invites.status = 'active'
+            """,
+            code.strip().upper(),
+        )
+        if row is None:
+            return None
+        return int(row["id"]), int(row["class_id"]), row["class_name"]
+    finally:
+        await connection.close()
+
+
+async def get_teacher_application(
+    max_user_id: int,
+) -> tuple[int, str, str, str, str | None] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT teacher_applications.id, teacher_applications.status,
+                   teacher_applications.full_name,
+                   teacher_applications.subject,
+                   teacher_applications.moderator_comment
+            FROM teacher_applications
+            WHERE teacher_applications.max_user_id = $1
+            """,
+            max_user_id,
+        )
+        if row is None:
+            return None
+        return (
+            int(row["id"]),
+            row["status"],
+            row["full_name"],
+            row["subject"],
+            row["moderator_comment"],
+        )
+    finally:
+        await connection.close()
+
+
+async def create_teacher_application(
+    max_user_id: int,
+    full_name: str,
+    subject: str,
+    invite_code: str,
+) -> tuple[str, int | None, str | None]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            invite = await connection.fetchrow(
+                """
+                SELECT teacher_invites.id, classes.name AS class_name
+                FROM teacher_invites
+                JOIN classes ON classes.id = teacher_invites.class_id
+                WHERE teacher_invites.code = $1
+                  AND teacher_invites.status = 'active'
+                FOR UPDATE
+                """,
+                invite_code.strip().upper(),
+            )
+            if invite is None:
+                return "invalid_code", None, None
+
+            existing = await connection.fetchrow(
+                """
+                SELECT id, status
+                FROM teacher_applications
+                WHERE max_user_id = $1
+                FOR UPDATE
+                """,
+                max_user_id,
+            )
+            if existing is not None and existing["status"] == "pending":
+                return "already_pending", int(existing["id"]), invite["class_name"]
+            if existing is not None and existing["status"] == "approved":
+                return "already_approved", int(existing["id"]), invite["class_name"]
+
+            invite_in_use = await connection.fetchrow(
+                """
+                SELECT id
+                FROM teacher_applications
+                WHERE invite_id = $1
+                  AND status = 'pending'
+                  AND max_user_id <> $2
+                LIMIT 1
+                """,
+                invite["id"],
+                max_user_id,
+            )
+            if invite_in_use is not None:
+                return "invite_in_use", None, invite["class_name"]
+
+            if existing is None:
+                application = await connection.fetchrow(
+                    """
+                    INSERT INTO teacher_applications (
+                        max_user_id, full_name, subject, invite_id
+                    )
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id
+                    """,
+                    max_user_id,
+                    full_name,
+                    subject,
+                    invite["id"],
+                )
+            else:
+                application = await connection.fetchrow(
+                    """
+                    UPDATE teacher_applications
+                    SET full_name = $2,
+                        subject = $3,
+                        invite_id = $4,
+                        status = 'pending',
+                        moderator_comment = NULL,
+                        updated_at = NOW()
+                    WHERE max_user_id = $1
+                    RETURNING id
+                    """,
+                    max_user_id,
+                    full_name,
+                    subject,
+                    invite["id"],
+                )
+            return "ok", int(application["id"]), invite["class_name"]
+    finally:
+        await connection.close()
+
+
+async def list_pending_teacher_applications() -> list[tuple[int, int, str, str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT teacher_applications.id, teacher_applications.max_user_id,
+                   teacher_applications.full_name, teacher_applications.subject,
+                   classes.name AS class_name
+            FROM teacher_applications
+            JOIN teacher_invites ON teacher_invites.id = teacher_applications.invite_id
+            JOIN classes ON classes.id = teacher_invites.class_id
+            WHERE teacher_applications.status = 'pending'
+            ORDER BY teacher_applications.created_at, teacher_applications.id
+            """
+        )
+        return [
+            (
+                int(row["id"]),
+                int(row["max_user_id"]),
+                row["full_name"],
+                row["subject"],
+                row["class_name"],
+            )
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
+async def moderate_teacher_application(
+    application_id: int,
+    moderator_max_user_id: int,
+    decision: str,
+    comment: str | None = None,
+) -> tuple[bool, str | None, int | None, str | None]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                """
+                SELECT teacher_applications.id,
+                       teacher_applications.max_user_id,
+                       teacher_applications.status,
+                       teacher_invites.id AS invite_id,
+                       teacher_invites.class_id,
+                       classes.name AS class_name
+                FROM teacher_applications
+                JOIN teacher_invites ON teacher_invites.id = teacher_applications.invite_id
+                JOIN classes ON classes.id = teacher_invites.class_id
+                WHERE teacher_applications.id = $1
+                FOR UPDATE
+                """,
+                application_id,
+            )
+            if row is None or row["status"] != "pending":
+                return False, None, None, None
+
+            if decision == "approved":
+                await connection.execute(
+                    """
+                    INSERT INTO users (max_user_id, role, class_id)
+                    VALUES ($1, 'teacher', $2)
+                    ON CONFLICT (max_user_id)
+                    DO UPDATE SET role = 'teacher', class_id = EXCLUDED.class_id
+                    """,
+                    row["max_user_id"],
+                    row["class_id"],
+                )
+                await connection.execute(
+                    """
+                    UPDATE teacher_applications
+                    SET status = 'approved', moderator_comment = $2, updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    application_id,
+                    comment,
+                )
+                await connection.execute(
+                    """
+                    UPDATE teacher_invites
+                    SET status = 'used', used_by_max_user_id = $2, used_at = NOW()
+                    WHERE id = $1
+                    """,
+                    row["invite_id"],
+                    row["max_user_id"],
+                )
+                return True, "approved", int(row["max_user_id"]), row["class_name"]
+
+            await connection.execute(
+                """
+                UPDATE teacher_applications
+                SET status = 'rejected', moderator_comment = $2, updated_at = NOW()
+                WHERE id = $1
+                """,
+                application_id,
+                comment,
+            )
+            return True, "rejected", int(row["max_user_id"]), row["class_name"]
     finally:
         await connection.close()
 
