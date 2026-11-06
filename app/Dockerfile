@@ -8,8 +8,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py db.py classes.py schema.sql ./
-COPY data ./data
+COPY app/main.py app/db.py app/classes.py app/schema.sql ./
+COPY app/data ./data
 
 CMD ["python", "main.py"]
 

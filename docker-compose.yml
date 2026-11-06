@@ -15,7 +15,9 @@ services:
       retries: 10
 
   app:
-    build: ./app
+    build:
+      context: .
+      dockerfile: app/Dockerfile
     restart: unless-stopped
     env_file: .env
     expose:

@@ -9,7 +9,7 @@
 
 - `app/Dockerfile` — сборка Docker-образа приложения;
 - `docker-compose.yml` — запуск приложения и PostgreSQL;
-- `app/requirements.txt` — зависимости Python с версиями;
+- `requirements.txt` — зависимости Python с версиями;
 - `README.md` — инструкция по настройке, сборке и запуску;
 - `.env.example` — пример переменных окружения без секретных значений.
 

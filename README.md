@@ -11,7 +11,7 @@
 
 - `app/Dockerfile` — инструкция сборки Docker-образа приложения;
 - `docker-compose.yml` — запуск приложения вместе с PostgreSQL;
-- `app/requirements.txt` — библиотеки Python и зафиксированные версии;
+- `requirements.txt` — библиотеки Python и зафиксированные версии;
 - `.env.example` — пример настроек без секретов;
 - этот README — инструкция запуска и описание проекта.
 
@@ -30,11 +30,15 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Соберите Docker-образ приложения:
+Соберите Docker-образ приложения из `app/Dockerfile`:
 
 ```powershell
 docker compose build app
 ```
+
+Команда создаёт локальный Docker-образ `aktivschool_bot-app`. Сам бинарный
+образ не хранится в Git как архив: он воспроизводимо собирается из
+`app/Dockerfile` и `requirements.txt`.
 
 Запустите контейнер приложения и PostgreSQL:
 
