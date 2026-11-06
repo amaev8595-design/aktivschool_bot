@@ -2152,5 +2152,5 @@ if __name__ == "__main__":
             port=int(os.getenv("WEBHOOK_PORT", "8080")),
         )
     else:
-        dispatcher.run_polling(bot)
+        dispatcher.run_polling(bot, clear_subscriptions=True)
 
