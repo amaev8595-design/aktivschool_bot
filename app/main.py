@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from db import (
     award_prize,
+    archive_class,
     bind_user_to_class,
     create_class,
     create_idea,
@@ -14,6 +15,7 @@ from db import (
     create_report,
     create_teacher_application,
     create_teacher_invite,
+    delete_class_if_empty,
     ensure_user_role,
     get_admin_ids,
     get_class_report,
@@ -24,11 +26,13 @@ from db import (
     get_idea_author_id,
     get_class_place,
     get_class_team,
+    get_class_usage,
     get_user_role,
     get_user_class,
     get_report_submitter_id,
     initialize_database,
     list_classes_with_codes,
+    list_classes_for_removal,
     list_events,
     list_pending_reports,
     list_pending_teacher_applications,
@@ -139,6 +143,7 @@ def admin_keyboard():
         KeyboardBuilder()
         .add_message(text="⚙️ Ценность месяца")
         .add_message(text="➕ Добавить класс")
+        .add_message(text="🗑 Удалить класс")
         .add_message(text="📅 Добавить мероприятие")
         .add_message(text="📚 Классы")
         .add_message(text="👥 Пользователи")
@@ -209,7 +214,10 @@ def context_keyboard(context: str):
     keyboards = {
         "value": options_keyboard("⚙️ Ценность месяца", "↩️ Администрирование"),
         "class": options_keyboard(
-            "➕ Добавить класс", "📚 Классы", "↩️ Администрирование"
+            "➕ Добавить класс",
+            "🗑 Удалить класс",
+            "📚 Классы",
+            "↩️ Администрирование",
         ),
         "event": options_keyboard(
             "📅 Добавить мероприятие", "🎪 Мероприятия", "↩️ Администрирование"
@@ -724,6 +732,118 @@ async def echo_handler(message: MessageCreated) -> None:
             pending_admin_forms.pop(message.user_id, None)
             await message.answer("Текущая форма отменена.", keyboard=admin_keyboard())
             return
+
+        if form.get("kind") == "deleteclass":
+            if form["step"] == "class":
+                classes = await list_classes_for_removal()
+                class_names = {name for name, _age_group in classes}
+                if value not in class_names:
+                    await message.answer(
+                        "Выберите класс кнопкой из списка.",
+                        keyboard=options_keyboard(
+                            *(name for name, _age_group in classes),
+                            "↩️ Отмена",
+                        ),
+                    )
+                    return
+
+                usage = await get_class_usage(value)
+                if usage is None:
+                    await message.answer(
+                        "Класс не найден. Обновите список и попробуйте снова.",
+                        keyboard=context_keyboard("class"),
+                    )
+                    pending_admin_forms.pop(message.user_id, None)
+                    return
+
+                form["class"] = value
+                usage_labels = (
+                    ("учеников", usage[1]),
+                    ("кодов учителей", usage[2]),
+                    ("мероприятий", usage[3]),
+                    ("записей на мероприятия", usage[4]),
+                    ("отчётов", usage[5]),
+                    ("идей", usage[6]),
+                    ("начислений баллов", usage[7]),
+                )
+                used_details = "\n".join(
+                    f"• {label}: {count}"
+                    for label, count in usage_labels
+                    if count
+                )
+                if used_details:
+                    form["step"] = "archive_confirm"
+                    await message.answer(
+                        f"Класс «{value}» нельзя удалить: он используется в системе.\n\n"
+                        f"Связанные данные:\n{used_details}\n\n"
+                        "Удаление может повредить историю. Архивировать класс?",
+                        keyboard=options_keyboard(
+                            "📦 Архивировать класс",
+                            "↩️ Отмена",
+                        ),
+                    )
+                    return
+
+                form["step"] = "delete_confirm"
+                await message.answer(
+                    f"Класс «{value}» пустой и не связан с данными.\n"
+                    "Удалить его окончательно?",
+                    keyboard=confirmation_keyboard("🗑 Удалить класс"),
+                )
+                return
+
+            if form["step"] == "archive_confirm":
+                if value != "📦 Архивировать класс":
+                    await message.answer(
+                        "Нажмите «📦 Архивировать класс» или «↩️ Отмена».",
+                        keyboard=options_keyboard(
+                            "📦 Архивировать класс",
+                            "↩️ Отмена",
+                        ),
+                    )
+                    return
+                archived = await archive_class(form["class"])
+                pending_admin_forms.pop(message.user_id, None)
+                await message.answer(
+                    (
+                        f"Класс «{form['class']}» архивирован. История сохранена, "
+                        "новая регистрация по его коду недоступна."
+                        if archived
+                        else "Не удалось архивировать класс. Возможно, он уже изменён."
+                    ),
+                    keyboard=context_keyboard("class"),
+                )
+                return
+
+            if form["step"] == "delete_confirm":
+                if value == "✏️ Изменить":
+                    form["step"] = "class"
+                    classes = await list_classes_for_removal()
+                    await message.answer(
+                        "Выберите класс заново:",
+                        keyboard=options_keyboard(
+                            *(name for name, _age_group in classes),
+                            "↩️ Отмена",
+                        ),
+                    )
+                    return
+                if value != "🗑 Удалить класс":
+                    await message.answer(
+                        "Нажмите «🗑 Удалить класс» или «✏️ Изменить».",
+                        keyboard=confirmation_keyboard("🗑 Удалить класс"),
+                    )
+                    return
+                deleted = await delete_class_if_empty(form["class"])
+                pending_admin_forms.pop(message.user_id, None)
+                await message.answer(
+                    (
+                        f"Класс «{form['class']}» удалён."
+                        if deleted
+                        else "Класс не удалён: он уже используется или был изменён."
+                    ),
+                    keyboard=context_keyboard("class"),
+                )
+                return
 
         if form.get("kind") == "addclass" and form["step"] == "name":
             if not value or len(value) > 40:
@@ -1438,6 +1558,10 @@ async def echo_handler(message: MessageCreated) -> None:
             {"kind": "addevent", "step": "title"},
             "Введите название мероприятия.",
         ),
+        "🗑 Удалить класс": (
+            {"kind": "deleteclass", "step": "class"},
+            "Выберите класс, который нужно удалить:",
+        ),
         "🛡 Назначить роль": (
             {"kind": "setrole", "step": "id"},
             "Введите ID пользователя.",
@@ -1502,6 +1626,19 @@ async def echo_handler(message: MessageCreated) -> None:
             classes = await list_classes_with_codes()
             keyboard = options_keyboard(
                 *(name for name, _age_group, _code in classes),
+                "↩️ Отмена",
+            )
+        elif text == "🗑 Удалить класс":
+            classes = await list_classes_for_removal()
+            if not classes:
+                pending_admin_forms.pop(message.user_id, None)
+                await message.answer(
+                    "Активных классов для удаления нет.",
+                    keyboard=context_keyboard("class"),
+                )
+                return
+            keyboard = options_keyboard(
+                *(name for name, _age_group in classes),
                 "↩️ Отмена",
             )
         await message.answer(

@@ -83,7 +83,11 @@ async def bind_user_to_class(max_user_id: int, invite_code: str) -> tuple[str, s
     connection = await asyncpg.connect(get_database_url())
     try:
         row = await connection.fetchrow(
-            "SELECT id, name, age_group FROM classes WHERE invite_code = $1",
+            """
+            SELECT id, name, age_group
+            FROM classes
+            WHERE invite_code = $1 AND archived = FALSE
+            """,
             invite_code.strip().upper(),
         )
         if row is None:
@@ -219,7 +223,7 @@ async def create_teacher_invite(class_name: str) -> tuple[str, str] | None:
     connection = await asyncpg.connect(get_database_url())
     try:
         class_row = await connection.fetchrow(
-            "SELECT id, name FROM classes WHERE name = $1",
+            "SELECT id, name FROM classes WHERE name = $1 AND archived = FALSE",
             class_name.strip(),
         )
         if class_row is None:
@@ -276,6 +280,7 @@ async def get_teacher_invite(code: str) -> tuple[int, int, str] | None:
             JOIN classes ON classes.id = teacher_invites.class_id
             WHERE teacher_invites.code = $1
               AND teacher_invites.status = 'active'
+              AND classes.archived = FALSE
             """,
             code.strip().upper(),
         )
@@ -331,6 +336,7 @@ async def create_teacher_application(
                 JOIN classes ON classes.id = teacher_invites.class_id
                 WHERE teacher_invites.code = $1
                   AND teacher_invites.status = 'active'
+              AND classes.archived = FALSE
                 FOR UPDATE
                 """,
                 invite_code.strip().upper(),
@@ -568,10 +574,112 @@ async def list_classes_with_codes() -> list[tuple[str, str, str]]:
             """
             SELECT name, age_group, invite_code
             FROM classes
+            WHERE archived = FALSE
             ORDER BY age_group, name
             """
         )
         return [(row["name"], row["age_group"], row["invite_code"]) for row in rows]
+    finally:
+        await connection.close()
+
+
+async def list_classes_for_removal() -> list[tuple[str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT name, age_group
+            FROM classes
+            WHERE archived = FALSE
+            ORDER BY age_group, name
+            """
+        )
+        return [(row["name"], row["age_group"]) for row in rows]
+    finally:
+        await connection.close()
+
+
+async def get_class_usage(class_name: str) -> tuple[int, int, int, int, int, int, int, int] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT classes.id,
+                   (SELECT COUNT(*) FROM users WHERE users.class_id = classes.id) AS users_count,
+                   (SELECT COUNT(*) FROM teacher_invites WHERE teacher_invites.class_id = classes.id) AS invites_count,
+                   (SELECT COUNT(*) FROM events WHERE events.author_class_id = classes.id) AS events_count,
+                   (SELECT COUNT(*) FROM event_signups WHERE event_signups.class_id = classes.id) AS signups_count,
+                   (SELECT COUNT(*) FROM reports WHERE reports.class_id = classes.id) AS reports_count,
+                   (SELECT COUNT(*) FROM ideas WHERE ideas.author_class_id = classes.id) AS ideas_count,
+                   (SELECT COUNT(*) FROM points_log WHERE points_log.class_id = classes.id) AS points_count
+            FROM classes
+            WHERE classes.name = $1 AND classes.archived = FALSE
+            """,
+            class_name,
+        )
+        if row is None:
+            return None
+        return tuple(
+            int(row[key])
+            for key in (
+                "id",
+                "users_count",
+                "invites_count",
+                "events_count",
+                "signups_count",
+                "reports_count",
+                "ideas_count",
+                "points_count",
+            )
+        )  # type: ignore[return-value]
+    finally:
+        await connection.close()
+
+
+async def delete_class_if_empty(class_name: str) -> bool:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                """
+                SELECT classes.id
+                FROM classes
+                WHERE classes.name = $1 AND classes.archived = FALSE
+                FOR UPDATE
+                """,
+                class_name,
+            )
+            if row is None:
+                return False
+            usage = await connection.fetchrow(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM users WHERE users.class_id = $1) AS users_count,
+                    (SELECT COUNT(*) FROM teacher_invites WHERE teacher_invites.class_id = $1) AS invites_count,
+                    (SELECT COUNT(*) FROM events WHERE events.author_class_id = $1) AS events_count,
+                    (SELECT COUNT(*) FROM event_signups WHERE event_signups.class_id = $1) AS signups_count,
+                    (SELECT COUNT(*) FROM reports WHERE reports.class_id = $1) AS reports_count,
+                    (SELECT COUNT(*) FROM ideas WHERE ideas.author_class_id = $1) AS ideas_count,
+                    (SELECT COUNT(*) FROM points_log WHERE points_log.class_id = $1) AS points_count
+                """,
+                row["id"],
+            )
+            if usage is None or any(int(usage[key]) for key in usage.keys()):
+                return False
+            await connection.execute("DELETE FROM classes WHERE id = $1", row["id"])
+            return True
+    finally:
+        await connection.close()
+
+
+async def archive_class(class_name: str) -> bool:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        result = await connection.execute(
+            "UPDATE classes SET archived = TRUE WHERE name = $1 AND archived = FALSE",
+            class_name,
+        )
+        return result == "UPDATE 1"
     finally:
         await connection.close()
 
@@ -585,7 +693,7 @@ async def create_event(
     connection = await asyncpg.connect(get_database_url())
     try:
         row = await connection.fetchrow(
-            "SELECT id FROM classes WHERE name = $1",
+            "SELECT id FROM classes WHERE name = $1 AND archived = FALSE",
             author_class_name,
         )
         if row is None:
