@@ -77,6 +77,7 @@ pending_class_code_users: set[int] = set()
 pending_ideas: dict[int, dict[str, str]] = {}
 pending_admin_actions: dict[int, str] = {}
 pending_admin_forms: dict[int, dict[str, str]] = {}
+pending_users_role: set[int] = set()
 pending_event_selection_users: set[int] = set()
 pending_report_selection_users: set[int] = set()
 pending_user_reports: dict[int, dict[str, str]] = {}
@@ -230,6 +231,15 @@ def context_keyboard(context: str):
     return keyboards[context]
 
 
+def users_role_keyboard():
+    return options_keyboard(
+        "👨‍🎓 Ученики",
+        "👩‍🏫 Учителя",
+        "👑 Администраторы",
+        "↩️ Администрирование",
+    )
+
+
 def user_context_keyboard(*labels: str, is_admin: bool = False):
     buttons = list(labels) + ["↩️ Главное меню"]
     if is_admin:
@@ -243,6 +253,38 @@ def event_entry_keyboard(is_admin: bool = False):
         "📋 Подать отчёт",
         is_admin=is_admin,
     )
+
+
+async def send_users_by_role(message: MessageCreated, role: str) -> None:
+    role_titles = {
+        "student": "👨‍🎓 Ученики",
+        "teacher": "👩‍🏫 Учителя",
+        "admin": "👑 Администраторы",
+    }
+    users = [user for user in await list_users() if user[1] == role]
+
+    # Администраторы из ADMIN_IDS могут ещё не иметь записи в таблице users.
+    if role == "admin":
+        known_ids = {user[0] for user in users}
+        users.extend(
+            (admin_id, "admin", None)
+            for admin_id in sorted(get_admin_ids())
+            if admin_id not in known_ids
+        )
+        users.sort(key=lambda user: user[0])
+
+    if not users:
+        await message.answer(
+            f"{role_titles[role]} пока нет.",
+            keyboard=context_keyboard("role"),
+        )
+        return
+
+    lines = [f"{role_titles[role]} (ID пользователей):"]
+    for max_user_id, _user_role, class_name in users:
+        class_text = f" — класс: {class_name}" if class_name else ""
+        lines.append(f"• {max_user_id}{class_text}")
+    await message.answer("\n".join(lines), keyboard=context_keyboard("role"))
 
 
 def event_selection_keyboard(events: list[tuple[int, str, str, str, str]]):
@@ -405,6 +447,7 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_ideas.pop(message.user_id, None)
         pending_admin_actions.pop(message.user_id, None)
         pending_admin_forms.pop(message.user_id, None)
+        pending_users_role.discard(message.user_id)
         pending_event_selection_users.discard(message.user_id)
         pending_report_selection_users.discard(message.user_id)
         pending_user_reports.pop(message.user_id, None)
@@ -436,11 +479,33 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_ideas.pop(message.user_id, None)
         pending_admin_actions.pop(message.user_id, None)
         pending_admin_forms.pop(message.user_id, None)
+        pending_users_role.discard(message.user_id)
         pending_event_selection_users.discard(message.user_id)
         pending_report_selection_users.discard(message.user_id)
         pending_user_reports.pop(message.user_id, None)
         pending_teacher_forms.pop(message.user_id, None)
         await start_handler(message)
+        return
+
+    if message.user_id in pending_users_role:
+        if text == "↩️ Администрирование":
+            pending_users_role.discard(message.user_id)
+            await admin_message(message)
+            return
+        role_by_button = {
+            "👨‍🎓 Ученики": "student",
+            "👩‍🏫 Учителя": "teacher",
+            "👑 Администраторы": "admin",
+        }
+        role = role_by_button.get(text)
+        if role is None:
+            await message.answer(
+                "Выберите категорию кнопкой.",
+                keyboard=users_role_keyboard(),
+            )
+            return
+        pending_users_role.discard(message.user_id)
+        await send_users_by_role(message, role)
         return
 
     if text == "👨‍🎓 Регистрация ученика":
@@ -1314,9 +1379,20 @@ async def echo_handler(message: MessageCreated) -> None:
         )
         return
 
+    if text == "👥 Пользователи":
+        if not await is_admin_user(message.user_id):
+            await message.answer("У вас нет прав администратора.")
+            return
+        pending_admin_actions.pop(message.user_id, None)
+        pending_users_role.add(message.user_id)
+        await message.answer(
+            "👥 Выберите, каких пользователей показать:",
+            keyboard=users_role_keyboard(),
+        )
+        return
+
     if text in {
         "📚 Классы",
-        "👥 Пользователи",
         "🎪 Мероприятия",
         "💡 Очередь идей",
         "📋 Очередь отчётов",
@@ -1330,7 +1406,6 @@ async def echo_handler(message: MessageCreated) -> None:
         admin_events_view = text == "🎪 Мероприятия"
         text = {
             "📚 Классы": "/classes",
-            "👥 Пользователи": "/users",
             "🎪 Мероприятия": "/events",
             "💡 Очередь идей": "/ideas",
             "📋 Очередь отчётов": "/reports",
@@ -1451,16 +1526,11 @@ async def echo_handler(message: MessageCreated) -> None:
         if not await is_admin_user(message.user_id):
             await message.answer("У вас нет прав администратора.")
             return
-        users = await list_users()
-        if not users:
-            await message.answer("Пользователей пока нет.", keyboard=context_keyboard("role"))
-            return
-        lines = ["👥 Пользователи и роли:"]
-        for max_user_id, role, class_name in users:
-            lines.append(
-                f"{max_user_id} — {role} — класс: {class_name or 'не привязан'}"
-            )
-        await message.answer("\n".join(lines), keyboard=context_keyboard("role"))
+        pending_users_role.add(message.user_id)
+        await message.answer(
+            "👥 Выберите, каких пользователей показать:",
+            keyboard=users_role_keyboard(),
+        )
         return
 
     if text == "/teacher_codes":
