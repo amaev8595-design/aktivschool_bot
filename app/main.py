@@ -37,7 +37,7 @@ from db import (
     list_signed_up_events,
     list_teacher_invites,
     list_user_ids_by_roles,
-    list_users,
+    list_users_with_details,
     moderate_idea,
     moderate_report,
     moderate_teacher_application,
@@ -261,13 +261,13 @@ async def send_users_by_role(message: MessageCreated, role: str) -> None:
         "teacher": "👩‍🏫 Учителя",
         "admin": "👑 Администраторы",
     }
-    users = [user for user in await list_users() if user[1] == role]
+    users = [user for user in await list_users_with_details() if user[1] == role]
 
     # Администраторы из ADMIN_IDS могут ещё не иметь записи в таблице users.
     if role == "admin":
         known_ids = {user[0] for user in users}
         users.extend(
-            (admin_id, "admin", None)
+            (admin_id, "admin", None, None, None)
             for admin_id in sorted(get_admin_ids())
             if admin_id not in known_ids
         )
@@ -281,7 +281,15 @@ async def send_users_by_role(message: MessageCreated, role: str) -> None:
         return
 
     lines = [f"{role_titles[role]} (ID пользователей):"]
-    for max_user_id, _user_role, class_name in users:
+    for max_user_id, _user_role, class_name, full_name, subject in users:
+        if role == "teacher" and full_name:
+            teacher_details = full_name
+            if subject:
+                teacher_details += f" — {subject}"
+            lines.append(f"• {teacher_details}\n  ID: {max_user_id}")
+            if class_name:
+                lines.append(f"  Класс: {class_name}")
+            continue
         class_text = f" — класс: {class_name}" if class_name else ""
         lines.append(f"• {max_user_id}{class_text}")
     await message.answer("\n".join(lines), keyboard=context_keyboard("role"))

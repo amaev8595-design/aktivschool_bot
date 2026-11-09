@@ -169,6 +169,38 @@ async def list_users() -> list[tuple[int, str, str | None]]:
         await connection.close()
 
 
+async def list_users_with_details() -> list[tuple[int, str, str | None, str | None, str | None]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT users.max_user_id,
+                   users.role,
+                   classes.name AS class_name,
+                   teacher_applications.full_name,
+                   teacher_applications.subject
+            FROM users
+            LEFT JOIN classes ON classes.id = users.class_id
+            LEFT JOIN teacher_applications
+              ON teacher_applications.max_user_id = users.max_user_id
+             AND teacher_applications.status = 'approved'
+            ORDER BY users.created_at, users.max_user_id
+            """
+        )
+        return [
+            (
+                int(row["max_user_id"]),
+                row["role"],
+                row["class_name"],
+                row["full_name"],
+                row["subject"],
+            )
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
 async def list_user_ids_by_roles(roles: set[str]) -> list[int]:
     if not roles:
         return []
