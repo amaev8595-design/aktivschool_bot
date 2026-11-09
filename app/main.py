@@ -287,6 +287,21 @@ async def is_moderator_user(user_id: int | None) -> bool:
     return await get_user_role(user_id) in {"admin", "moderator"}
 
 
+async def can_change_admin_role(target_id: int, new_role: str) -> bool:
+    """Не позволяет удалить последнего администратора проекта."""
+    if target_id in get_admin_ids() and new_role != "admin":
+        return False
+    if new_role == "admin":
+        return True
+    if await get_user_role(target_id) != "admin":
+        return True
+
+    admin_ids = set(get_admin_ids())
+    admin_ids.update(await list_user_ids_by_roles({"admin"}))
+    admin_ids.discard(target_id)
+    return bool(admin_ids)
+
+
 async def entry_keyboard(user_id: int | None):
     is_admin = await is_admin_user(user_id)
     user_class = await get_user_class(user_id) if user_id is not None else None
@@ -845,6 +860,7 @@ async def echo_handler(message: MessageCreated) -> None:
                 await message.answer(
                     "Выберите новую роль:",
                     keyboard=options_keyboard(
+                        "👑 Администратор",
                         "🛡 Модератор",
                         "👩‍🏫 Учитель",
                         "👤 Участник",
@@ -853,6 +869,7 @@ async def echo_handler(message: MessageCreated) -> None:
                 )
                 return
             roles = {
+                "👑 Администратор": "admin",
                 "🛡 Модератор": "moderator",
                 "👩‍🏫 Учитель": "teacher",
                 "👤 Участник": "student",
@@ -1551,16 +1568,18 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer("У вас нет прав администратора.")
             return
         parts = text.split()
-        allowed_roles = {"student", "teacher", "moderator"}
+        allowed_roles = {"student", "teacher", "moderator", "admin"}
         if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in allowed_roles:
             await message.answer(
-                "Формат: /setrole ID moderator|teacher|student\n"
-                "Пример: /setrole 123456 moderator"
+                "Формат: /setrole ID admin|moderator|teacher|student\n"
+                "Пример: /setrole 123456 admin"
             )
             return
         target_id = int(parts[1])
-        if target_id in get_admin_ids():
-            await message.answer("Пользователь из ADMIN_IDS не может быть понижен этой командой.")
+        if not await can_change_admin_role(target_id, parts[2]):
+            await message.answer(
+                "Нельзя снять права: должен остаться хотя бы один администратор."
+            )
             return
         await set_user_role(target_id, parts[2])
         await message.answer(
