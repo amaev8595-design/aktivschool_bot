@@ -2,10 +2,49 @@ import csv
 import json
 import os
 import secrets
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import asyncpg
+
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+
+def moscow_today() -> date:
+    return datetime.now(MOSCOW_TZ).date()
+
+
+def month_start(value: date) -> date:
+    return value.replace(day=1)
+
+
+def next_month(value: date) -> date:
+    if value.month == 12:
+        return date(value.year + 1, 1, 1)
+    return date(value.year, value.month + 1, 1)
+
+
+def report_deadline(period_month: date) -> date:
+    """Последний день приёма отчётов за месяц — 5-е число следующего месяца."""
+    return next_month(period_month).replace(day=5)
+
+
+def academic_year_start(value: date) -> date:
+    """Учебный год начинается в сентябре и состоит из периодов сентябрь–май."""
+    return date(value.year if value.month >= 9 else value.year - 1, 9, 1)
+
+
+def academic_year_label(value: date) -> str:
+    start_year = academic_year_start(value).year
+    return f"{start_year}/{start_year + 1}"
+
+
+def created_month(value: datetime) -> date:
+    if value.tzinfo is not None:
+        value = value.astimezone(MOSCOW_TZ)
+    return month_start(value.date())
 
 
 def get_admin_ids() -> set[int]:
@@ -806,6 +845,24 @@ async def signup_for_event(max_user_id: int, event_id: int) -> str:
         await connection.close()
 
 
+async def _report_period_status(
+    connection: asyncpg.Connection,
+    event_date: date,
+) -> str:
+    """Проверяет, открыт ли календарный период для отправки отчёта."""
+    await close_due_rating_periods(connection)
+    period_month = month_start(event_date)
+    row = await connection.fetchrow(
+        "SELECT status FROM rating_periods WHERE period_month = $1",
+        period_month,
+    )
+    if row is None:
+        return "period_not_open"
+    if row["status"] != "open" or moscow_today() > report_deadline(period_month):
+        return "period_closed"
+    return "ok"
+
+
 async def create_report(
     max_user_id: int,
     event_id: int,
@@ -835,6 +892,16 @@ async def create_report(
         )
         if signup is None:
             return "not_signed", None
+
+        event = await connection.fetchrow(
+            "SELECT event_date FROM events WHERE id = $1 AND status = 'approved'",
+            event_id,
+        )
+        if event is None:
+            return "not_found", None
+        period_status = await _report_period_status(connection, event["event_date"])
+        if period_status != "ok":
+            return period_status, None
 
         existing = await connection.fetchrow(
             """
@@ -939,6 +1006,16 @@ async def revise_report(
         if signup is None:
             return "not_signed", None
 
+        event = await connection.fetchrow(
+            "SELECT event_date FROM events WHERE id = $1 AND status = 'approved'",
+            event_id,
+        )
+        if event is None:
+            return "not_found", None
+        period_status = await _report_period_status(connection, event["event_date"])
+        if period_status != "ok":
+            return period_status, None
+
         report = await connection.fetchrow(
             """
             SELECT id, status, submitted_by_max_user_id
@@ -1034,9 +1111,11 @@ async def moderate_report(
         async with connection.transaction():
             row = await connection.fetchrow(
                 """
-                SELECT id, class_id, status
+                SELECT reports.id, reports.class_id, reports.status,
+                       events.event_date
                 FROM reports
-                WHERE id = $1
+                JOIN events ON events.id = reports.event_id
+                WHERE reports.id = $1
                 FOR UPDATE
                 """,
                 report_id,
@@ -1075,8 +1154,10 @@ async def moderate_report(
                 )
                 await connection.execute(
                     """
-                    INSERT INTO points_log (class_id, reason, points, confirmed_by)
-                    VALUES ($1, $2, $4, (
+                    INSERT INTO points_log (
+                        class_id, reason, points, period_month, confirmed_by
+                    )
+                    VALUES ($1, $2, $4, $5, (
                         SELECT id FROM users WHERE max_user_id = $3
                     ))
                     """,
@@ -1084,7 +1165,9 @@ async def moderate_report(
                     f"Отчёт №{report_id} подтверждён",
                     moderator_max_user_id,
                     points,
+                    month_start(row["event_date"]),
                 )
+                await refresh_period_winners(connection, month_start(row["event_date"]))
                 return True, "approved", points
 
             await connection.execute(
@@ -1106,37 +1189,308 @@ async def moderate_report(
         await connection.close()
 
 
-async def list_rating() -> list[tuple[str, str, int]]:
+async def refresh_period_winners(
+    connection: asyncpg.Connection,
+    period_month: date,
+) -> None:
+    """Пересчитывает победителей закрытого месяца, включая поздние одобрения."""
+    period = await connection.fetchrow(
+        """
+        SELECT id, status
+        FROM rating_periods
+        WHERE period_month = $1
+        """,
+        period_month,
+    )
+    if period is None or period["status"] != "closed":
+        return
+
+    await connection.execute(
+        "DELETE FROM rating_winners WHERE period_id = $1",
+        period["id"],
+    )
+    maximum = await connection.fetchval(
+        """
+        SELECT MAX(total_points)
+        FROM (
+            SELECT class_id, SUM(points) AS total_points
+            FROM points_log
+            WHERE period_month = $1
+            GROUP BY class_id
+        ) totals
+        """,
+        period_month,
+    )
+    if maximum is None or maximum <= 0:
+        return
+
+    await connection.execute(
+        """
+        INSERT INTO rating_winners (period_id, class_id, points)
+        SELECT $1, class_id, SUM(points)
+        FROM points_log
+        WHERE period_month = $2
+        GROUP BY class_id
+        HAVING SUM(points) = $3
+        ON CONFLICT (period_id, class_id)
+        DO UPDATE SET points = EXCLUDED.points
+        """,
+        period["id"],
+        period_month,
+        maximum,
+    )
+
+
+async def close_due_rating_periods(
+    connection: asyncpg.Connection,
+) -> None:
+    """Закрывает месяцы после 5-го числа следующего месяца."""
+    today = moscow_today()
+    rows = await connection.fetch(
+        """
+        SELECT period_month
+        FROM rating_periods
+        WHERE status = 'open'
+        """
+    )
+    for row in rows:
+        period_month = row["period_month"]
+        if today <= report_deadline(period_month):
+            continue
+        await connection.execute(
+            """
+            UPDATE rating_periods
+            SET status = 'closed', closed_at = NOW()
+            WHERE period_month = $1 AND status = 'open'
+            """,
+            period_month,
+        )
+        await refresh_period_winners(connection, period_month)
+
+
+async def set_monthly_value(value: str) -> tuple[str, date]:
+    """Открывает текущий календарный месяц и сохраняет его ценность."""
     connection = await asyncpg.connect(get_database_url())
     try:
-        rows = await connection.fetch(
-            """
-            SELECT name, age_group, points
-            FROM classes
-            ORDER BY points DESC, age_group, name
-            """
-        )
-        return [(row["name"], row["age_group"], row["points"]) for row in rows]
+        async with connection.transaction():
+            await close_due_rating_periods(connection)
+            period_month = month_start(moscow_today())
+            existing = await connection.fetchrow(
+                """
+                SELECT status
+                FROM rating_periods
+                WHERE period_month = $1
+                FOR UPDATE
+                """,
+                period_month,
+            )
+            if existing is not None and existing["status"] == "closed":
+                return "closed", period_month
+
+            await connection.execute(
+                """
+                INSERT INTO rating_periods (period_month, monthly_value, status)
+                VALUES ($1, $2, 'open')
+                ON CONFLICT (period_month)
+                DO UPDATE SET monthly_value = EXCLUDED.monthly_value,
+                              status = 'open'
+                """,
+                period_month,
+                value,
+            )
+            await connection.execute(
+                """
+                INSERT INTO settings (key, value, updated_at)
+                VALUES ('monthly_value', $1::jsonb, NOW())
+                ON CONFLICT (key)
+                DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """,
+                json.dumps(value, ensure_ascii=False),
+            )
+            return "ok", period_month
     finally:
         await connection.close()
+
+
+async def get_current_month_value() -> str | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await close_due_rating_periods(connection)
+        period_month = month_start(moscow_today())
+        row = await connection.fetchrow(
+            """
+            SELECT monthly_value
+            FROM rating_periods
+            WHERE period_month = $1
+            """,
+            period_month,
+        )
+        if row is not None:
+            return row["monthly_value"]
+        return None
+    finally:
+        await connection.close()
+
+
+async def _list_period_rating(
+    connection: asyncpg.Connection,
+    period_month: date,
+) -> list[tuple[str, str, int, bool]]:
+    rows = await connection.fetch(
+        """
+        SELECT classes.name, classes.age_group,
+               COALESCE(totals.points, 0)::int AS points,
+               (rating_winners.class_id IS NOT NULL) AS is_winner
+        FROM classes
+        LEFT JOIN (
+            SELECT class_id, SUM(points)::int AS points
+            FROM points_log
+            WHERE period_month = $1
+            GROUP BY class_id
+        ) totals ON totals.class_id = classes.id
+        LEFT JOIN rating_periods
+            ON rating_periods.period_month = $1
+        LEFT JOIN rating_winners
+            ON rating_winners.period_id = rating_periods.id
+           AND rating_winners.class_id = classes.id
+        ORDER BY points DESC, classes.age_group, classes.name
+        """,
+        period_month,
+    )
+    return [
+        (row["name"], row["age_group"], row["points"], row["is_winner"])
+        for row in rows
+    ]
+
+
+async def list_current_month_rating() -> tuple[date, str | None, list[tuple[str, str, int, bool]]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await close_due_rating_periods(connection)
+        period_month = month_start(moscow_today())
+        value = await connection.fetchval(
+            "SELECT monthly_value FROM rating_periods WHERE period_month = $1",
+            period_month,
+        )
+        return period_month, value, await _list_period_rating(connection, period_month)
+    finally:
+        await connection.close()
+
+
+async def list_academic_year_rating() -> tuple[str, int, bool, list[tuple[str, str, int, bool]]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await close_due_rating_periods(connection)
+        today = moscow_today()
+        start = academic_year_start(today)
+        end = date(start.year + 1, 5, 1)
+        closed_count = await connection.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM rating_periods
+            WHERE period_month BETWEEN $1 AND $2
+              AND status = 'closed'
+            """,
+            start,
+            end,
+        )
+        complete = int(closed_count) == 9
+        rows = await connection.fetch(
+            """
+            SELECT classes.name, classes.age_group,
+                   COALESCE(totals.points, 0)::int AS points,
+                   FALSE AS is_winner
+            FROM classes
+            LEFT JOIN (
+                SELECT class_id, SUM(points)::int AS points
+                FROM points_log
+                WHERE period_month BETWEEN $1 AND $2
+                GROUP BY class_id
+            ) totals ON totals.class_id = classes.id
+            ORDER BY points DESC, classes.age_group, classes.name
+            """,
+            start,
+            end,
+        )
+        rating = [
+            (row["name"], row["age_group"], row["points"], False)
+            for row in rows
+        ]
+        if complete and rating:
+            maximum = rating[0][2]
+            rating = [
+                (name, age_group, points, points == maximum and points > 0)
+                for name, age_group, points, _ in rating
+            ]
+        return academic_year_label(today), int(closed_count), complete, rating
+    finally:
+        await connection.close()
+
+
+async def list_rating_history() -> list[tuple[date, str, list[str], int | None]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await close_due_rating_periods(connection)
+        rows = await connection.fetch(
+            """
+            SELECT rating_periods.period_month,
+                   rating_periods.monthly_value,
+                   ARRAY_REMOVE(ARRAY_AGG(classes.name ORDER BY classes.name), NULL)
+                       AS winner_names,
+                   MAX(rating_winners.points) AS winner_points
+            FROM rating_periods
+            LEFT JOIN rating_winners
+                ON rating_winners.period_id = rating_periods.id
+            LEFT JOIN classes ON classes.id = rating_winners.class_id
+            WHERE rating_periods.status = 'closed'
+            GROUP BY rating_periods.id, rating_periods.period_month,
+                     rating_periods.monthly_value
+            ORDER BY rating_periods.period_month DESC
+            """
+        )
+        return [
+            (
+                row["period_month"],
+                row["monthly_value"],
+                list(row["winner_names"] or []),
+                row["winner_points"],
+            )
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
+async def list_rating() -> list[tuple[str, str, int]]:
+    """Совместимость со старым вызовом: теперь это рейтинг текущего месяца."""
+    _period_month, _value, rating = await list_current_month_rating()
+    return [(name, age_group, points) for name, age_group, points, _ in rating]
 
 
 async def get_class_place(max_user_id: int) -> tuple[int, str, str, int] | None:
     connection = await asyncpg.connect(get_database_url())
     try:
+        await close_due_rating_periods(connection)
+        period_month = month_start(moscow_today())
         row = await connection.fetchrow(
             """
             WITH ranked_classes AS (
-                SELECT id, name, age_group, points,
-                       RANK() OVER (ORDER BY points DESC) AS place
+                SELECT classes.id, classes.name, classes.age_group,
+                       COALESCE(SUM(points_log.points), 0)::int AS points,
+                       RANK() OVER (ORDER BY COALESCE(SUM(points_log.points), 0) DESC) AS place
                 FROM classes
+                LEFT JOIN points_log
+                    ON points_log.class_id = classes.id
+                   AND points_log.period_month = $1
+                GROUP BY classes.id, classes.name, classes.age_group
             )
             SELECT ranked_classes.place, ranked_classes.name,
                    ranked_classes.age_group, ranked_classes.points
             FROM users
             JOIN ranked_classes ON ranked_classes.id = users.class_id
-            WHERE users.max_user_id = $1
+            WHERE users.max_user_id = $2
             """,
+            period_month,
             max_user_id,
         )
         if row is None:
@@ -1261,7 +1615,8 @@ async def moderate_idea(
             row = await connection.fetchrow(
                 """
                 SELECT id, author_class_id, status
-                       , title, description, target_group, author_user_id
+                       , title, description, target_group, author_user_id,
+                       created_at
                 FROM ideas
                 WHERE id = $1
                 FOR UPDATE
@@ -1314,8 +1669,10 @@ async def moderate_idea(
                 )
                 await connection.execute(
                     """
-                    INSERT INTO points_log (class_id, reason, points, confirmed_by)
-                    VALUES ($1, $2, $4, (
+                    INSERT INTO points_log (
+                        class_id, reason, points, period_month, confirmed_by
+                    )
+                    VALUES ($1, $2, $4, $5, (
                         SELECT id FROM users WHERE max_user_id = $3
                     ))
                     """,
@@ -1323,6 +1680,10 @@ async def moderate_idea(
                     f"Идея №{idea_id} прошла модерацию",
                     moderator_id,
                     points,
+                    created_month(row["created_at"]),
+                )
+                await refresh_period_winners(
+                    connection, created_month(row["created_at"])
                 )
                 event = await connection.fetchrow(
                     """
@@ -1376,8 +1737,10 @@ async def award_prize(class_name: str, place: int, confirmer_id: int) -> tuple[b
             )
             await connection.execute(
                 """
-                INSERT INTO points_log (class_id, reason, points, confirmed_by)
-                VALUES ($1, $2, $3, (
+                INSERT INTO points_log (
+                    class_id, reason, points, period_month, confirmed_by
+                )
+                VALUES ($1, $2, $3, $5, (
                     SELECT id FROM users WHERE max_user_id = $4
                 ))
                 """,
@@ -1385,7 +1748,9 @@ async def award_prize(class_name: str, place: int, confirmer_id: int) -> tuple[b
                 f"Призовое место: {place}",
                 points,
                 confirmer_id,
+                month_start(moscow_today()),
             )
+            await refresh_period_winners(connection, month_start(moscow_today()))
             return True, points
     finally:
         await connection.close()

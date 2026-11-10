@@ -22,13 +22,13 @@ from db import (
     get_moderator_ids,
     get_teacher_application,
     get_teacher_invite,
-    get_setting_text,
     get_idea_author_id,
     get_class_place,
     get_class_team,
     get_class_usage,
     get_user_role,
     get_user_class,
+    get_current_month_value,
     get_report_submitter_id,
     initialize_database,
     list_classes_with_codes,
@@ -37,7 +37,9 @@ from db import (
     list_pending_reports,
     list_pending_teacher_applications,
     list_pending_ideas,
-    list_rating,
+    list_academic_year_rating,
+    list_current_month_rating,
+    list_rating_history,
     list_signed_up_events,
     list_teacher_invites,
     list_user_ids_by_roles,
@@ -47,6 +49,7 @@ from db import (
     moderate_teacher_application,
     revise_report,
     set_user_role,
+    set_monthly_value,
     set_setting,
     signup_for_event,
 )
@@ -253,6 +256,15 @@ def user_context_keyboard(*labels: str, is_admin: bool = False):
     if is_admin:
         buttons.append("⚙️ Администрирование")
     return options_keyboard(*buttons)
+
+
+def rating_keyboard(is_admin: bool = False):
+    return user_context_keyboard(
+        "📊 Рейтинг текущего месяца",
+        "🏅 Рейтинг учебного года",
+        "📅 История рейтингов",
+        is_admin=is_admin,
+    )
 
 
 def event_entry_keyboard(is_admin: bool = False):
@@ -1468,6 +1480,18 @@ async def echo_handler(message: MessageCreated) -> None:
             if result == "not_signed":
                 await message.answer("Ваш класс не записан на это мероприятие.")
                 return
+            if result == "period_not_open":
+                await message.answer(
+                    "Отчёты за этот месяц ещё не принимаются: администратор ещё не ввёл "
+                    "ценность месяца."
+                )
+                return
+            if result == "period_closed":
+                await message.answer(
+                    "Срок сдачи отчётов за этот месяц завершён. "
+                    "Новые отчёты больше не принимаются."
+                )
+                return
             report_kind = (
                 "Исправленный отчёт"
                 if report_form.get("mode") == "revise"
@@ -1648,9 +1672,13 @@ async def echo_handler(message: MessageCreated) -> None:
         return
 
     if text == "🎯 Ценность месяца":
-        value = await get_setting_text("monthly_value", "Взаимопомощь")
+        value = await get_current_month_value()
         await message.answer(
-            f"🎯 Ценность месяца: {value}",
+            (
+                f"🎯 Ценность текущего месяца: {value}"
+                if value
+                else "🎯 Ценность текущего месяца ещё не введена администратором."
+            ),
             keyboard=user_context_keyboard(
                 is_admin=await is_admin_user(message.user_id),
             ),
@@ -1834,8 +1862,18 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer("Формат: /setvalue Текст ценности месяца")
             return
         await ensure_user_role(message.user_id, "admin")
-        await set_setting("monthly_value", value)
-        await message.answer(f"Ценность месяца изменена: {value}", keyboard=context_keyboard("value"))
+        status, period_month = await set_monthly_value(value)
+        if status == "closed":
+            await message.answer(
+                "Текущий календарный месяц уже закрыт. Изменить его ценность нельзя.",
+                keyboard=context_keyboard("value"),
+            )
+            return
+        await message.answer(
+            f"Ценность месяца {period_month.strftime('%m.%Y')} установлена: {value}\n"
+            "Отчёты за этот месяц будут учитываться в отдельном рейтинге.",
+            keyboard=context_keyboard("value"),
+        )
         return
 
     if text == "/addclass" or text.startswith("/addclass "):
@@ -2258,19 +2296,66 @@ async def echo_handler(message: MessageCreated) -> None:
             )
         return
 
-    if text == "🏆 Рейтинг":
-        rating = await list_rating()
-        lines = ["🏆 Рейтинг классов:"]
-        for position, (name, age_group, points) in enumerate(rating, start=1):
-            lines.append(f"{position}. {name} ({age_group}) — {points} баллов")
-        await message.answer(
-            "\n".join(lines),
-            keyboard=user_context_keyboard(
-                "📍 Место",
-                "👥 Команда",
-                is_admin=await is_admin_user(message.user_id),
-            ),
+    if text in {"🏆 Рейтинг", "📊 Рейтинг текущего месяца"}:
+        period_month, value, rating = await list_current_month_rating()
+        lines = [f"📊 Рейтинг текущего месяца ({period_month.strftime('%m.%Y')}):"]
+        if value:
+            lines.append(f"🎯 Ценность: {value}")
+        else:
+            lines.append("Ценность месяца ещё не введена администратором.")
+        lines.append("")
+        last_points = None
+        current_rank = 0
+        for position, (name, age_group, points, is_winner) in enumerate(rating, start=1):
+            if points != last_points:
+                current_rank = position
+                last_points = points
+            badge = "🏆 " if is_winner else ""
+            lines.append(
+                f"{current_rank}. {badge}{name} ({age_group}) — {points} баллов"
+            )
+        await message.answer("\n".join(lines), keyboard=rating_keyboard(await is_admin_user(message.user_id)))
+        return
+
+    if text == "🏅 Рейтинг учебного года":
+        year_label, closed_count, complete, rating = await list_academic_year_rating()
+        lines = [f"🏅 Рейтинг учебного года {year_label}:"]
+        lines.append(
+            "Итоговый рейтинг сформирован."
+            if complete
+            else f"Предварительный рейтинг: закрыто месяцев {closed_count} из 9."
         )
+        lines.append("")
+        last_points = None
+        current_rank = 0
+        for position, (name, age_group, points, is_winner) in enumerate(rating, start=1):
+            if points != last_points:
+                current_rank = position
+                last_points = points
+            badge = "👑 " if is_winner else ""
+            lines.append(
+                f"{current_rank}. {badge}{name} ({age_group}) — {points} баллов"
+            )
+        await message.answer("\n".join(lines), keyboard=rating_keyboard(await is_admin_user(message.user_id)))
+        return
+
+    if text == "📅 История рейтингов":
+        history = await list_rating_history()
+        if not history:
+            await message.answer(
+                "Закрытых месяцев пока нет.",
+                keyboard=rating_keyboard(await is_admin_user(message.user_id)),
+            )
+            return
+        lines = ["📅 История рейтингов:"]
+        for period_month, value, winners, winner_points in history:
+            winner_text = ", ".join(winners) if winners else "победитель не определён"
+            points_text = f" — {winner_points} баллов" if winner_points is not None else ""
+            lines.append(
+                f"\n{period_month.strftime('%m.%Y')} · {value}\n"
+                f"🏆 {winner_text}{points_text}"
+            )
+        await message.answer("\n".join(lines), keyboard=rating_keyboard(await is_admin_user(message.user_id)))
         return
 
     if text == "📍 Место":
@@ -2284,7 +2369,7 @@ async def echo_handler(message: MessageCreated) -> None:
         place, class_name, age_group, points = class_place
         await message.answer(
             f"📍 Место класса {class_name} ({age_group}): {place}\n"
-            f"Баллы: {points}",
+            f"Баллы за текущий месяц: {points}",
             keyboard=user_context_keyboard(
                 "🏆 Рейтинг",
                 "👥 Команда",

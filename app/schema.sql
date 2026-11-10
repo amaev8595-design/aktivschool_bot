@@ -110,8 +110,39 @@ CREATE TABLE IF NOT EXISTS points_log (
     class_id BIGINT NOT NULL REFERENCES classes(id),
     reason TEXT NOT NULL,
     points INTEGER NOT NULL,
+    period_month DATE,
     confirmed_by BIGINT REFERENCES users(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE points_log ADD COLUMN IF NOT EXISTS period_month DATE;
+UPDATE points_log
+SET period_month = date_trunc('month', created_at AT TIME ZONE 'Europe/Moscow')::date
+WHERE period_month IS NULL;
+ALTER TABLE points_log
+    ALTER COLUMN period_month SET DEFAULT (date_trunc(
+        'month', timezone('Europe/Moscow', NOW())
+    )::date);
+ALTER TABLE points_log ALTER COLUMN period_month SET NOT NULL;
+
+CREATE TABLE IF NOT EXISTS rating_periods (
+    id BIGSERIAL PRIMARY KEY,
+    period_month DATE NOT NULL UNIQUE,
+    monthly_value TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'closed')),
+    opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    closed_at TIMESTAMPTZ,
+    CHECK (period_month = (date_trunc('month', period_month)::date))
+);
+
+CREATE TABLE IF NOT EXISTS rating_winners (
+    id BIGSERIAL PRIMARY KEY,
+    period_id BIGINT NOT NULL REFERENCES rating_periods(id) ON DELETE CASCADE,
+    class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+    points INTEGER NOT NULL CHECK (points >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (period_id, class_id)
 );
 
 CREATE TABLE IF NOT EXISTS settings (
