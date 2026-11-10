@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from contextlib import asynccontextmanager, suppress
 from datetime import date
 
@@ -92,7 +93,14 @@ pending_event_selection_users: set[int] = set()
 pending_report_selection_users: set[int] = set()
 pending_user_reports: dict[int, dict[str, str]] = {}
 pending_teacher_forms: dict[int, dict[str, str]] = {}
+pending_rating_context: dict[int, dict[str, str]] = {}
 BOT_MODE = os.getenv("BOT_MODE", "polling").strip().lower()
+
+AGE_GROUP_LABELS = {
+    "1-4": "1–4 классы",
+    "5-8": "5–8 классы",
+    "9-11": "9–11 классы",
+}
 
 
 def media_tokens(message: MessageCreated) -> str | None:
@@ -283,7 +291,176 @@ def rating_keyboard(is_admin: bool = False):
         "📊 Рейтинг текущего месяца",
         "🏅 Рейтинг учебного года",
         "📅 История рейтингов",
+        "↩️ Выбрать категорию",
         is_admin=is_admin,
+    )
+
+
+def rating_group_keyboard(age_groups: list[str], is_admin: bool = False):
+    labels = [AGE_GROUP_LABELS[group] for group in age_groups if group in AGE_GROUP_LABELS]
+    return user_context_keyboard(*labels, is_admin=is_admin)
+
+
+async def available_rating_groups(user_id: int) -> list[str]:
+    if await is_moderator_user(user_id):
+        return list(AGE_GROUP_LABELS)
+    user_class = await get_user_class(user_id)
+    return [user_class[1]] if user_class and user_class[1] in AGE_GROUP_LABELS else []
+
+
+async def begin_rating_selection(message: MessageCreated) -> None:
+    user_id = message.user_id
+    if user_id is None:
+        await message.answer("Не удалось определить пользователя MAX.")
+        return
+    age_groups = await available_rating_groups(user_id)
+    if not age_groups:
+        await message.answer(
+            "Сначала привяжите пользователя к классу через /start.",
+            keyboard=registration_keyboard(),
+        )
+        return
+    pending_rating_context[user_id] = {"step": "age_group"}
+    await message.answer(
+        "🏆 Выберите возрастную группу для рейтинга:",
+        keyboard=rating_group_keyboard(age_groups, await is_admin_user(user_id)),
+    )
+
+
+def target_group_is_within_age_group(target_group: str, age_group: str) -> bool:
+    bounds = {"1-4": (1, 4), "5-8": (5, 8), "9-11": (9, 11)}
+    if age_group not in bounds:
+        return False
+    low, high = bounds[age_group]
+    normalized = target_group.replace("–", "-").replace("—", "-")
+    mentioned_grades: list[int] = []
+    for start, end in re.findall(
+        r"(?<!\d)(1[01]|[1-9])\s*(?:-|по)\s*(1[01]|[1-9])(?!\d)",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        mentioned_grades.extend((int(start), int(end)))
+    mentioned_grades.extend(
+        int(value)
+        for value in re.findall(
+            r"(?<!\d)(1[01]|[1-9])\s*(?:-?(?:й|ый|ой|ого|го|му)\s*)?"
+            r"(?:класс(?:а|ов|е|ы)?|кл\.?)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+    return all(low <= grade <= high for grade in mentioned_grades)
+
+
+def rating_label(age_group: str) -> str:
+    return AGE_GROUP_LABELS.get(age_group, age_group)
+
+
+async def show_current_month_rating(message: MessageCreated, age_group: str) -> None:
+    period_month, value, rating = await list_current_month_rating(age_group)
+    lines = [
+        f"📊 Рейтинг {rating_label(age_group)} за {period_month.strftime('%m.%Y')}:"
+    ]
+    if value:
+        lines.append(f"🎯 Ценность: {value}")
+    else:
+        lines.append("Ценность месяца ещё не введена администратором.")
+    lines.append("")
+    last_points = None
+    current_rank = 0
+    for position, (name, _group, points, is_winner) in enumerate(rating, start=1):
+        if points != last_points:
+            current_rank = position
+            last_points = points
+        badge = "🏆 " if is_winner else ""
+        lines.append(f"{current_rank}. {badge}{name} — {points} баллов")
+    await answer_lines(
+        message,
+        lines,
+        rating_keyboard(await is_admin_user(message.user_id)),
+    )
+
+
+async def show_academic_year_rating(message: MessageCreated, age_group: str) -> None:
+    year_label, closed_count, complete, rating = await list_academic_year_rating(age_group)
+    lines = [f"🏅 Рейтинг {rating_label(age_group)} за учебный год {year_label}:"]
+    lines.append(
+        "Итоговый рейтинг сформирован."
+        if complete
+        else f"Предварительный рейтинг: закрыто месяцев {closed_count} из 9."
+    )
+    lines.append("")
+    last_points = None
+    current_rank = 0
+    for position, (name, _group, points, is_winner) in enumerate(rating, start=1):
+        if points != last_points:
+            current_rank = position
+            last_points = points
+        badge = "👑 " if is_winner else ""
+        lines.append(f"{current_rank}. {badge}{name} — {points} баллов")
+    await answer_lines(
+        message,
+        lines,
+        rating_keyboard(await is_admin_user(message.user_id)),
+    )
+
+
+async def show_rating_history(message: MessageCreated, age_group: str) -> None:
+    history = await list_rating_history(age_group)
+    if not history:
+        await message.answer(
+            f"Для группы {rating_label(age_group)} закрытых месяцев пока нет.",
+            keyboard=rating_keyboard(await is_admin_user(message.user_id)),
+        )
+        return
+    lines = [f"📅 История рейтингов · {rating_label(age_group)}"]
+    for period_month, value, winners, winner_points in history:
+        winner_text = ", ".join(winners) if winners else "победитель не определён"
+        points_text = f" — {winner_points} баллов" if winner_points is not None else ""
+        lines.append(
+            f"\n{period_month.strftime('%m.%Y')} · {value}\n"
+            f"🏆 {winner_text}{points_text}"
+        )
+    history_keyboard = options_keyboard(
+        *(f"📊 Месяц {row[0].strftime('%Y-%m')}" for row in history[:12]),
+        "📊 Рейтинг текущего месяца",
+        "🏅 Рейтинг учебного года",
+        "↩️ Выбрать категорию",
+        "🏆 Рейтинг",
+    )
+    await answer_lines(message, lines, history_keyboard)
+
+
+async def show_archived_month_rating(
+    message: MessageCreated,
+    period_month: date,
+    age_group: str,
+) -> None:
+    result = await get_month_rating(period_month, age_group)
+    if result is None:
+        await message.answer("Этот месяц ещё не открывался.")
+        return
+    value, status, rating = result
+    lines = [
+        f"📊 Рейтинг {rating_label(age_group)} за "
+        f"{period_month.strftime('%m.%Y')} · {value}"
+    ]
+    lines.append(
+        "Месяц закрыт. 🏆 — победители."
+        if status == "closed"
+        else "Приём отчётов ещё открыт до 5-го числа следующего месяца."
+    )
+    lines.append("Своевременно сданные отчёты учитываются после проверки; итоги могут уточняться.")
+    last_points, rank = None, 0
+    for position, (name, _group, points, winner) in enumerate(rating, 1):
+        if points != last_points:
+            rank, last_points = position, points
+        badge = "🏆 " if winner else ""
+        lines.append(f"{rank}. {badge}{name} — {points} баллов")
+    await answer_lines(
+        message,
+        lines,
+        rating_keyboard(await is_admin_user(message.user_id)),
     )
 
 
@@ -335,14 +512,14 @@ async def send_users_by_role(message: MessageCreated, role: str) -> None:
     await message.answer("\n".join(lines), keyboard=context_keyboard("role"))
 
 
-def event_selection_keyboard(events: list[tuple[int, str, str, str, str]]):
+def event_selection_keyboard(events: list[tuple[int, str, str, str, str, str]]):
     return options_keyboard(
         *(f"№{event_id}" for event_id, *_ in events),
         "↩️ Назад",
     )
 
 
-def report_selection_keyboard(events: list[tuple[int, str, str, str, str]]):
+def report_selection_keyboard(events: list[tuple[int, str, str, str, str, str]]):
     return options_keyboard(
         *(f"📋 Отчёт №{event_id}" for event_id, *_ in events),
         "↩️ Назад",
@@ -375,6 +552,19 @@ async def is_moderator_user(user_id: int | None) -> bool:
     if user_id in get_admin_ids() or user_id in get_moderator_ids():
         return True
     return await get_user_role(user_id) in {"admin", "moderator"}
+
+
+async def events_visible_to_user(
+    user_id: int | None,
+) -> list[tuple[int, str, str, str, str, str]]:
+    if await is_moderator_user(user_id):
+        return await list_events()
+    if user_id is None:
+        return []
+    user_class = await get_user_class(user_id)
+    if user_class is None:
+        return []
+    return await list_events(user_class[1])
 
 
 async def can_change_admin_role(target_id: int, new_role: str) -> bool:
@@ -503,6 +693,7 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_report_selection_users.discard(message.user_id)
         pending_user_reports.pop(message.user_id, None)
         pending_teacher_forms.pop(message.user_id, None)
+        pending_rating_context.pop(message.user_id, None)
         await message.answer(
             "Текущий сценарий отменён.",
             keyboard=await entry_keyboard(message.user_id),
@@ -535,6 +726,7 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_report_selection_users.discard(message.user_id)
         pending_user_reports.pop(message.user_id, None)
         pending_teacher_forms.pop(message.user_id, None)
+        pending_rating_context.pop(message.user_id, None)
         await start_handler(message)
         return
 
@@ -600,8 +792,12 @@ async def echo_handler(message: MessageCreated) -> None:
                 return
             idea["description"] = value
             idea["step"] = "target_group"
+            age_group = idea.get("age_group", "")
             await message.answer(
-                "Шаг 3 из 3. Для кого подходит идея? Например: 5-8 классы.",
+                f"Шаг 3 из 3. Для кого подходит идея внутри вашей группы "
+                f"{AGE_GROUP_LABELS.get(age_group, age_group)}? "
+                "Укажите только классы из этого диапазона, например «все "
+                f"{AGE_GROUP_LABELS.get(age_group, age_group)}».",
                 keyboard=cancel_keyboard(),
             )
             return
@@ -609,6 +805,14 @@ async def echo_handler(message: MessageCreated) -> None:
         if idea["step"] == "target_group":
             if not value or len(value) > 100:
                 await message.answer("Укажите группу длиной до 100 символов.")
+                return
+            if not target_group_is_within_age_group(value, idea.get("age_group", "")):
+                allowed_group = AGE_GROUP_LABELS.get(idea.get("age_group", ""), "вашей группы")
+                await message.answer(
+                    f"Идею можно предложить только своей возрастной группе: {allowed_group}. "
+                    "Исправьте аудиторию и отправьте ещё раз.",
+                    keyboard=cancel_keyboard(),
+                )
                 return
             idea_status, idea_id = await create_idea(
                 message.user_id,
@@ -635,6 +839,7 @@ async def echo_handler(message: MessageCreated) -> None:
             )
             await message.answer(
                 f"Идея №{idea_id} отправлена на модерацию.\n"
+                f"Категория: {rating_label(idea['age_group'])}.\n"
                 "Решение модератора появится в уведомлениях.",
                 keyboard=user_context_keyboard(
                     "💡 Подать идею",
@@ -1046,20 +1251,55 @@ async def echo_handler(message: MessageCreated) -> None:
                     return
                 form["date"] = value
                 form["step"] = "class"
-                await message.answer("Введите класс-организатор, например 9А.", keyboard=cancel_keyboard())
+                classes = await list_classes_with_codes()
+                if not classes:
+                    await message.answer(
+                        "Сначала добавьте хотя бы один активный класс.",
+                        keyboard=context_keyboard("class"),
+                    )
+                    pending_admin_forms.pop(message.user_id, None)
+                    return
+                class_choices = [
+                    f"{name} · {rating_label(age_group)}"
+                    for name, age_group, _code in classes
+                ]
+                await message.answer(
+                    "Выберите класс-организатор. Мероприятие автоматически попадёт "
+                    "в возрастную группу этого класса:",
+                    keyboard=options_keyboard(*class_choices, "↩️ Отмена"),
+                )
                 return
             if form["step"] == "class":
-                if not value or len(value) > 40:
-                    await message.answer("Введите название класса длиной до 40 символов.")
+                classes = await list_classes_with_codes()
+                class_by_label = {
+                    f"{name} · {rating_label(age_group)}": (name, age_group)
+                    for name, age_group, _code in classes
+                }
+                selected_class = class_by_label.get(value)
+                if selected_class is None:
+                    selected_class = next(
+                        ((name, group) for name, group, _code in classes if name == value),
+                        None,
+                    )
+                if selected_class is None:
+                    choices = [
+                        f"{name} · {rating_label(age_group)}"
+                        for name, age_group, _code in classes
+                    ]
+                    await message.answer(
+                        "Выберите класс из списка, чтобы верно определить категорию.",
+                        keyboard=options_keyboard(*choices, "↩️ Отмена"),
+                    )
                     return
-                form["class"] = value
+                form["class"], form["age_group"] = selected_class
                 form["step"] = "confirm"
                 await message.answer(
                     "Проверьте мероприятие:\n"
                     f"Название: {form['title']}\n"
                     f"Описание: {form['description']}\n"
                     f"Дата: {form['date']}\n"
-                    f"Класс: {form['class']}\n\n"
+                    f"Класс-организатор: {form['class']}\n"
+                    f"Категория: {rating_label(form['age_group'])}\n\n"
                     "Сохранить мероприятие?",
                     keyboard=confirmation_keyboard("✅ Сохранить мероприятие"),
                 )
@@ -1347,10 +1587,11 @@ async def echo_handler(message: MessageCreated) -> None:
             return
         pending_report_selection_users.add(message.user_id)
         lines = ["📋 Выберите мероприятие для отчёта:"]
-        for event_id, title, description, event_date, class_name in report_events:
+        for event_id, title, description, event_date, class_name, age_group in report_events:
             lines.append(
                 f"\n№{event_id} · {event_date} · {title}\n"
-                f"{description}\nОрганизатор: класс {class_name}"
+                f"{description}\nОрганизатор: класс {class_name} "
+                f"({AGE_GROUP_LABELS.get(age_group, age_group)})"
             )
         await message.answer(
             "\n".join(lines),
@@ -1505,6 +1746,9 @@ async def echo_handler(message: MessageCreated) -> None:
                 return
             if result == "not_signed":
                 await message.answer("Ваш класс не записан на это мероприятие.")
+                return
+            if result == "wrong_group":
+                await message.answer("Это мероприятие относится к другой возрастной группе.")
                 return
             if result == "period_not_open":
                 await message.answer(
@@ -1974,6 +2218,7 @@ async def echo_handler(message: MessageCreated) -> None:
             if len(parts) != 4 or not all(parts):
                 await message.answer(
                     "Формат администратора: /addevent Название|Описание|YYYY-MM-DD|Класс\n"
+                    "Категория определяется по возрастной группе указанного класса.\n"
                     "Пример: /addevent Квест благодарности|Командная игра|2026-11-08|9А"
                 )
                 return
@@ -1999,15 +2244,25 @@ async def echo_handler(message: MessageCreated) -> None:
         if event_id is None:
             await message.answer("Класс не найден. Сначала проверьте список командой /classes.")
             return
+        active_classes = await list_classes_for_removal()
+        class_age_group = next(
+            (age_group for class_name, age_group in active_classes if class_name == author_class_name),
+            None,
+        )
+        category_text = (
+            f" Категория: {rating_label(class_age_group)}."
+            if class_age_group
+            else ""
+        )
         await message.answer(
-            f"Мероприятие №{event_id} добавлено в афишу.\n"
+            f"Мероприятие №{event_id} добавлено в афишу.{category_text}\n"
             "Пользователи увидят его через кнопку «🎪 Афиша».",
             keyboard=context_keyboard("event") if is_admin else main_keyboard(),
         )
         return
 
     if text == "🤝 Принять участие":
-        events = await list_events()
+        events = await events_visible_to_user(message.user_id)
         if not events:
             await message.answer(
                 "Сейчас нет доступных мероприятий.",
@@ -2019,10 +2274,11 @@ async def echo_handler(message: MessageCreated) -> None:
             return
         pending_event_selection_users.add(message.user_id)
         lines = ["🎪 Выберите номер мероприятия для участия:"]
-        for event_id, title, description, event_date, class_name in events:
+        for event_id, title, description, event_date, class_name, age_group in events:
             lines.append(
                 f"\n№{event_id} · {event_date} · {title}\n"
-                f"{description}\nОрганизатор: класс {class_name}"
+                f"{description}\nОрганизатор: класс {class_name} "
+                f"({AGE_GROUP_LABELS.get(age_group, age_group)})"
             )
         await message.answer("\n".join(lines), keyboard=event_selection_keyboard(events))
         return
@@ -2051,7 +2307,7 @@ async def echo_handler(message: MessageCreated) -> None:
         text = "🎪 Афиша"
 
     if text == "/events" or text == "🎪 Афиша":
-        events = await list_events()
+        events = await events_visible_to_user(message.user_id)
         is_admin = await is_admin_user(message.user_id)
         if not events:
             await message.answer(
@@ -2060,11 +2316,12 @@ async def echo_handler(message: MessageCreated) -> None:
             )
             return
         lines = ["🎪 Афиша мероприятий:"]
-        for event_id, title, description, event_date, class_name in events:
+        for event_id, title, description, event_date, class_name, age_group in events:
             lines.append(
                 f"\n№{event_id} · {event_date} · {title}\n"
                 f"{description}\n"
-                f"Организатор: класс {class_name}\n"
+                f"Организатор: класс {class_name} "
+                f"({AGE_GROUP_LABELS.get(age_group, age_group)})\n"
                 "Для записи нажмите соответствующую кнопку ниже."
             )
         await message.answer(
@@ -2086,6 +2343,7 @@ async def echo_handler(message: MessageCreated) -> None:
         responses = {
             "not_bound": "Сначала привяжите пользователя к классу через /start.",
             "not_found": "Мероприятие не найдено или уже недоступно.",
+            "wrong_group": "Это мероприятие относится к другой возрастной группе.",
             "already": "Ваш класс уже записан на это мероприятие.",
             "ok": "Готово! Ваш класс записан на мероприятие.",
         }
@@ -2104,6 +2362,7 @@ async def echo_handler(message: MessageCreated) -> None:
         responses = {
             "not_bound": "Сначала привяжите пользователя к классу через /start.",
             "not_found": "Мероприятие не найдено или уже недоступно.",
+            "wrong_group": "Это мероприятие относится к другой возрастной группе.",
             "already": "Ваш класс уже записан на это мероприятие.",
             "ok": "Готово! Ваш класс записан на мероприятие.",
         }
@@ -2145,6 +2404,7 @@ async def echo_handler(message: MessageCreated) -> None:
         responses = {
             "not_bound": "Сначала привяжите пользователя к классу через /start.",
             "not_signed": "Ваш класс не записан на это мероприятие.",
+            "wrong_group": "Это мероприятие относится к другой возрастной группе.",
             "not_found": "Мероприятие не найдено.",
             "event_not_finished": "Мероприятие ещё не состоялось.",
             "period_not_open": "Месяц ещё не открыт: администратор должен ввести его ценность.",
@@ -2187,9 +2447,10 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer("Очередь идей пуста.", keyboard=context_keyboard("idea"))
             return
         lines = ["📝 Идеи на модерации:"]
-        for idea_id, title, description, target_group, class_name in ideas:
+        for idea_id, title, description, target_group, class_name, age_group in ideas:
             lines.append(
-                f"\n№{idea_id} от класса {class_name}\n"
+                f"\n№{idea_id} · группа {AGE_GROUP_LABELS.get(age_group, age_group)} "
+                f"· класс {class_name}\n"
                 f"{title}\n{description}\nДля: {target_group}"
             )
         await message.answer(
@@ -2269,10 +2530,21 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer("Очередь отчётов пуста.", keyboard=report_actions_keyboard())
             return
         lines = ["📋 Отчёты на проверке:"]
-        for report_id, event_id, title, class_name, comment, media_token in reports:
+        for (
+            report_id,
+            event_id,
+            title,
+            class_name,
+            class_age_group,
+            event_age_group,
+            comment,
+            media_token,
+        ) in reports:
             lines.append(
                 f"\nОтчёт №{report_id}, мероприятие №{event_id}: {title}\n"
-                f"Класс: {class_name}\n{comment}"
+                f"Класс: {class_name} ({AGE_GROUP_LABELS.get(class_age_group, class_age_group)})\n"
+                f"Группа мероприятия: {AGE_GROUP_LABELS.get(event_age_group, event_age_group)}\n"
+                f"{comment}"
                 + ("\nПрикреплён медиа-файл." if media_token else "")
             )
         await message.answer(
@@ -2295,6 +2567,12 @@ async def echo_handler(message: MessageCreated) -> None:
             report_id, message.user_id, "approved"
         )
         if not changed:
+            if status == "wrong_group":
+                await message.answer(
+                    "Отчёт нельзя одобрить: класс участника и группа мероприятия не совпадают. "
+                    "Такой отчёт можно отклонить с пояснением."
+                )
+                return
             await message.answer("Отчёт не найден или уже обработан.")
             return
         await message.answer(
@@ -2338,93 +2616,78 @@ async def echo_handler(message: MessageCreated) -> None:
             )
         return
 
-    if text in {"🏆 Рейтинг", "📊 Рейтинг текущего месяца"}:
-        period_month, value, rating = await list_current_month_rating()
-        lines = [f"📊 Рейтинг текущего месяца ({period_month.strftime('%m.%Y')}):"]
-        if value:
-            lines.append(f"🎯 Ценность: {value}")
-        else:
-            lines.append("Ценность месяца ещё не введена администратором.")
-        lines.append("")
-        last_points = None
-        current_rank = 0
-        for position, (name, age_group, points, is_winner) in enumerate(rating, start=1):
-            if points != last_points:
-                current_rank = position
-                last_points = points
-            badge = "🏆 " if is_winner else ""
-            lines.append(
-                f"{current_rank}. {badge}{name} ({age_group}) — {points} баллов"
-            )
-        await answer_lines(message, lines, rating_keyboard(await is_admin_user(message.user_id)))
+    if text in {"🏆 Рейтинг", "↩️ Выбрать категорию"}:
+        await begin_rating_selection(message)
         return
 
-    if text == "🏅 Рейтинг учебного года":
-        year_label, closed_count, complete, rating = await list_academic_year_rating()
-        lines = [f"🏅 Рейтинг учебного года {year_label}:"]
-        lines.append(
-            "Итоговый рейтинг сформирован."
-            if complete
-            else f"Предварительный рейтинг: закрыто месяцев {closed_count} из 9."
-        )
-        lines.append("")
-        last_points = None
-        current_rank = 0
-        for position, (name, age_group, points, is_winner) in enumerate(rating, start=1):
-            if points != last_points:
-                current_rank = position
-                last_points = points
-            badge = "👑 " if is_winner else ""
-            lines.append(
-                f"{current_rank}. {badge}{name} ({age_group}) — {points} баллов"
-            )
-        await answer_lines(message, lines, rating_keyboard(await is_admin_user(message.user_id)))
-        return
-
-    if text == "📅 История рейтингов":
-        history = await list_rating_history()
-        if not history:
+    selected_age_group = next(
+        (group for group, label in AGE_GROUP_LABELS.items() if text == label),
+        None,
+    )
+    if selected_age_group is not None and message.user_id is not None:
+        rating_state = pending_rating_context.get(message.user_id)
+        if rating_state and rating_state.get("step") == "age_group":
+            allowed_groups = await available_rating_groups(message.user_id)
+            if selected_age_group not in allowed_groups:
+                await begin_rating_selection(message)
+                return
+            requested_month = rating_state.get("month")
+            rating_state = {"step": "period", "age_group": selected_age_group}
+            pending_rating_context[message.user_id] = rating_state
+            if requested_month:
+                await show_archived_month_rating(
+                    message,
+                    date.fromisoformat(requested_month),
+                    selected_age_group,
+                )
+                return
             await message.answer(
-                "Открытых месяцев пока нет.",
+                f"Выбрана группа {rating_label(selected_age_group)}. "
+                "Выберите период рейтинга:",
                 keyboard=rating_keyboard(await is_admin_user(message.user_id)),
             )
             return
-        lines = ["📅 История рейтингов. Для полного списка нажмите месяц ниже или введите /rating ГГГГ-ММ."]
-        for period_month, value, winners, winner_points in history:
-            winner_text = ", ".join(winners) if winners else "победитель не определён"
-            points_text = f" — {winner_points} баллов" if winner_points is not None else ""
-            lines.append(
-                f"\n{period_month.strftime('%m.%Y')} · {value}\n"
-                f"🏆 {winner_text}{points_text}"
-            )
-        await answer_lines(message, lines, options_keyboard(
-            *(f"📊 Месяц {row[0].strftime('%Y-%m')}" for row in history[:12]),
-            "🏆 Рейтинг",
-        ))
+
+    if text in {"📊 Рейтинг текущего месяца", "🏅 Рейтинг учебного года", "📅 История рейтингов"}:
+        if message.user_id is None:
+            await message.answer("Не удалось определить пользователя MAX.")
+            return
+        state = pending_rating_context.get(message.user_id)
+        if state is None or not state.get("age_group"):
+            await begin_rating_selection(message)
+            return
+        age_group = state["age_group"]
+        if age_group not in await available_rating_groups(message.user_id):
+            await begin_rating_selection(message)
+            return
+        if text == "📊 Рейтинг текущего месяца":
+            await show_current_month_rating(message, age_group)
+        elif text == "🏅 Рейтинг учебного года":
+            await show_academic_year_rating(message, age_group)
+        else:
+            await show_rating_history(message, age_group)
         return
 
     if text.startswith("📊 Месяц ") or text.startswith("/rating "):
+        if message.user_id is None:
+            await message.answer("Не удалось определить пользователя MAX.")
+            return
         raw_month = text.removeprefix("📊 Месяц ").removeprefix("/rating ").strip()
         try:
             period_month = date.fromisoformat(raw_month + "-01")
         except ValueError:
             await message.answer("Укажите месяц в формате /rating 2026-11.")
             return
-        result = await get_month_rating(period_month)
-        if result is None:
-            await message.answer("Этот месяц ещё не открывался.")
+        state = pending_rating_context.get(message.user_id)
+        if state is None or not state.get("age_group"):
+            await begin_rating_selection(message)
+            if message.user_id in pending_rating_context:
+                pending_rating_context[message.user_id]["month"] = period_month.isoformat()
             return
-        value, status, rating = result
-        lines = [f"📊 Рейтинг за {period_month.strftime('%m.%Y')} · {value}"]
-        lines.append("Месяц закрыт. 🏆 — победители." if status == "closed" else "Приём отчётов ещё открыт до 5-го числа следующего месяца.")
-        lines.append("Своевременно сданные отчёты учитываются после проверки; итоги могут уточняться.")
-        last_points, rank = None, 0
-        for position, (name, age_group, points, winner) in enumerate(rating, 1):
-            if points != last_points:
-                rank, last_points = position, points
-            badge = "🏆 " if winner else ""
-            lines.append(f"{rank}. {badge}{name} ({age_group}) — {points} баллов")
-        await answer_lines(message, lines, rating_keyboard(await is_admin_user(message.user_id)))
+        if state.get("age_group") not in await available_rating_groups(message.user_id):
+            await begin_rating_selection(message)
+            return
+        await show_archived_month_rating(message, period_month, state["age_group"])
         return
 
     if text == "📍 Место":
@@ -2471,7 +2734,8 @@ async def echo_handler(message: MessageCreated) -> None:
         if message.user_id is None or await get_user_class(message.user_id) is None:
             await message.answer("Сначала привяжите пользователя к классу через /start.")
             return
-        pending_ideas[message.user_id] = {"step": "title"}
+        user_class = await get_user_class(message.user_id)
+        pending_ideas[message.user_id] = {"step": "title", "age_group": user_class[1]}
         await message.answer(
             "Шаг 1 из 3. Введите название идеи (до 120 символов).\n"
             "Для отмены нажмите «↩️ Отмена».",

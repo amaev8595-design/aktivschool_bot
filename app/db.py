@@ -763,18 +763,27 @@ async def create_event(
         await connection.close()
 
 
-async def list_events() -> list[tuple[int, str, str, str, str]]:
+async def list_events(
+    age_group: str | None = None,
+) -> list[tuple[int, str, str, str, str, str]]:
+    """Список одобренных мероприятий для указанной возрастной группы.
+
+    Если группа не задана, возвращает все мероприятия (для администраторов и модераторов).
+    """
     connection = await asyncpg.connect(get_database_url())
     try:
         rows = await connection.fetch(
             """
             SELECT events.id, events.title, events.description,
-                   events.event_date, classes.name AS class_name
+                   events.event_date, classes.name AS class_name,
+                   classes.age_group
             FROM events
             JOIN classes ON classes.id = events.author_class_id
             WHERE events.status = 'approved'
+              AND ($1::text IS NULL OR classes.age_group = $1)
             ORDER BY events.event_date, events.id
-            """
+            """,
+            age_group,
         )
         return [
             (
@@ -783,6 +792,7 @@ async def list_events() -> list[tuple[int, str, str, str, str]]:
                 row["description"],
                 row["event_date"].isoformat(),
                 row["class_name"],
+                row["age_group"],
             )
             for row in rows
         ]
@@ -790,17 +800,23 @@ async def list_events() -> list[tuple[int, str, str, str, str]]:
         await connection.close()
 
 
-async def list_signed_up_events(max_user_id: int) -> list[tuple[int, str, str, str, str]]:
+async def list_signed_up_events(
+    max_user_id: int,
+) -> list[tuple[int, str, str, str, str, str]]:
     connection = await asyncpg.connect(get_database_url())
     try:
         rows = await connection.fetch(
             """
             SELECT events.id, events.title, events.description,
-                   events.event_date, classes.name AS class_name
+                   events.event_date, event_classes.name AS class_name,
+                   event_classes.age_group
             FROM users
             JOIN event_signups ON event_signups.class_id = users.class_id
             JOIN events ON events.id = event_signups.event_id
-            JOIN classes ON classes.id = events.author_class_id
+            JOIN classes AS user_classes ON user_classes.id = users.class_id
+            JOIN classes AS event_classes
+              ON event_classes.id = events.author_class_id
+             AND event_classes.age_group = user_classes.age_group
             WHERE users.max_user_id = $1
               AND events.status = 'approved'
             ORDER BY events.event_date, events.id
@@ -814,6 +830,7 @@ async def list_signed_up_events(max_user_id: int) -> list[tuple[int, str, str, s
                 row["description"],
                 row["event_date"].isoformat(),
                 row["class_name"],
+                row["age_group"],
             )
             for row in rows
         ]
@@ -825,18 +842,30 @@ async def signup_for_event(max_user_id: int, event_id: int) -> str:
     connection = await asyncpg.connect(get_database_url())
     try:
         user = await connection.fetchrow(
-            "SELECT class_id FROM users WHERE max_user_id = $1",
+            """
+            SELECT users.class_id, classes.age_group
+            FROM users
+            JOIN classes ON classes.id = users.class_id
+            WHERE users.max_user_id = $1
+            """,
             max_user_id,
         )
         if user is None or user["class_id"] is None:
             return "not_bound"
 
         event = await connection.fetchrow(
-            "SELECT id FROM events WHERE id = $1 AND status = 'approved'",
+            """
+            SELECT events.id, classes.age_group
+            FROM events
+            JOIN classes ON classes.id = events.author_class_id
+            WHERE events.id = $1 AND events.status = 'approved'
+            """,
             event_id,
         )
         if event is None:
             return "not_found"
+        if event["age_group"] != user["age_group"]:
+            return "wrong_group"
 
         try:
             await connection.execute(
@@ -883,11 +912,30 @@ async def create_report(
     connection = await asyncpg.connect(get_database_url())
     try:
         user = await connection.fetchrow(
-            "SELECT class_id FROM users WHERE max_user_id = $1",
+            """
+            SELECT users.class_id, classes.age_group
+            FROM users
+            JOIN classes ON classes.id = users.class_id
+            WHERE users.max_user_id = $1
+            """,
             max_user_id,
         )
         if user is None or user["class_id"] is None:
             return "not_bound", None
+
+        event = await connection.fetchrow(
+            """
+            SELECT events.event_date, classes.age_group
+            FROM events
+            JOIN classes ON classes.id = events.author_class_id
+            WHERE events.id = $1 AND events.status = 'approved'
+            """,
+            event_id,
+        )
+        if event is None:
+            return "not_found", None
+        if event["age_group"] != user["age_group"]:
+            return "wrong_group", None
 
         signup = await connection.fetchrow(
             """
@@ -904,12 +952,6 @@ async def create_report(
         if signup is None:
             return "not_signed", None
 
-        event = await connection.fetchrow(
-            "SELECT event_date FROM events WHERE id = $1 AND status = 'approved'",
-            event_id,
-        )
-        if event is None:
-            return "not_found", None
         period_status = await _report_period_status(connection, event["event_date"])
         if period_status != "ok":
             return period_status, None
@@ -965,6 +1007,11 @@ async def get_class_report(
                    COALESCE(reports.moderator_comment, '') AS moderator_comment
             FROM reports
             JOIN users ON users.class_id = reports.class_id
+            JOIN classes AS user_classes ON user_classes.id = users.class_id
+            JOIN events ON events.id = reports.event_id
+            JOIN classes AS event_classes
+              ON event_classes.id = events.author_class_id
+             AND event_classes.age_group = user_classes.age_group
             WHERE users.max_user_id = $1
               AND reports.event_id = $2
             ORDER BY reports.id
@@ -996,11 +1043,30 @@ async def revise_report(
     connection = await asyncpg.connect(get_database_url())
     try:
         user = await connection.fetchrow(
-            "SELECT class_id FROM users WHERE max_user_id = $1",
+            """
+            SELECT users.class_id, classes.age_group
+            FROM users
+            JOIN classes ON classes.id = users.class_id
+            WHERE users.max_user_id = $1
+            """,
             max_user_id,
         )
         if user is None or user["class_id"] is None:
             return "not_bound", None
+
+        event = await connection.fetchrow(
+            """
+            SELECT events.event_date, classes.age_group
+            FROM events
+            JOIN classes ON classes.id = events.author_class_id
+            WHERE events.id = $1 AND events.status = 'approved'
+            """,
+            event_id,
+        )
+        if event is None:
+            return "not_found", None
+        if event["age_group"] != user["age_group"]:
+            return "wrong_group", None
 
         signup = await connection.fetchrow(
             """
@@ -1017,12 +1083,6 @@ async def revise_report(
         if signup is None:
             return "not_signed", None
 
-        event = await connection.fetchrow(
-            "SELECT event_date FROM events WHERE id = $1 AND status = 'approved'",
-            event_id,
-        )
-        if event is None:
-            return "not_found", None
         period_status = await _report_period_status(connection, event["event_date"])
         if period_status != "ok":
             return period_status, None
@@ -1080,18 +1140,21 @@ async def get_report_submitter_id(report_id: int) -> int | None:
         await connection.close()
 
 
-async def list_pending_reports() -> list[tuple[int, int, str, str, str, str]]:
+async def list_pending_reports() -> list[tuple[int, int, str, str, str, str, str, str]]:
     connection = await asyncpg.connect(get_database_url())
     try:
         rows = await connection.fetch(
             """
             SELECT reports.id, events.id AS event_id, events.title,
                    classes.name AS class_name,
+                   classes.age_group AS class_age_group,
+                   event_classes.age_group AS event_age_group,
                    COALESCE(reports.comment, '') AS comment,
                    COALESCE(reports.media_token, '') AS media_token
             FROM reports
             JOIN events ON events.id = reports.event_id
             JOIN classes ON classes.id = reports.class_id
+            JOIN classes AS event_classes ON event_classes.id = events.author_class_id
             WHERE reports.status = 'pending'
             ORDER BY reports.created_at, reports.id
             """
@@ -1102,6 +1165,8 @@ async def list_pending_reports() -> list[tuple[int, int, str, str, str, str]]:
                 row["event_id"],
                 row["title"],
                 row["class_name"],
+                row["class_age_group"],
+                row["event_age_group"],
                 row["comment"],
                 row["media_token"],
             )
@@ -1124,11 +1189,15 @@ async def moderate_report(
             row = await connection.fetchrow(
                 """
                 SELECT reports.id, reports.class_id, reports.status,
-                       events.event_date
+                       events.event_date,
+                       report_classes.age_group AS report_age_group,
+                       event_classes.age_group AS event_age_group
                 FROM reports
                 JOIN events ON events.id = reports.event_id
+                JOIN classes AS report_classes ON report_classes.id = reports.class_id
+                JOIN classes AS event_classes ON event_classes.id = events.author_class_id
                 WHERE reports.id = $1
-                FOR UPDATE
+                FOR UPDATE OF reports
                 """,
                 report_id,
             )
@@ -1136,6 +1205,8 @@ async def moderate_report(
                 return False, None, None
 
             if decision == "approved":
+                if row["report_age_group"] != row["event_age_group"]:
+                    return False, "wrong_group", None
                 points_row = await connection.fetchrow(
                     """
                     SELECT COALESCE((
@@ -1221,35 +1292,29 @@ async def refresh_period_winners(
         "DELETE FROM rating_winners WHERE period_id = $1",
         period["id"],
     )
-    maximum = await connection.fetchval(
-        """
-        SELECT MAX(total_points)
-        FROM (
-            SELECT class_id, SUM(points) AS total_points
-            FROM points_log
-            WHERE period_month = $1
-            GROUP BY class_id
-        ) totals
-        """,
-        period_month,
-    )
-    if maximum is None or maximum <= 0:
-        return
-
     await connection.execute(
         """
+        WITH totals AS (
+            SELECT points_log.class_id, classes.age_group,
+                   SUM(points_log.points)::int AS points
+            FROM points_log
+            JOIN classes ON classes.id = points_log.class_id
+            WHERE points_log.period_month = $2
+            GROUP BY points_log.class_id, classes.age_group
+        ), ranked AS (
+            SELECT class_id, age_group, points,
+                   MAX(points) OVER (PARTITION BY age_group) AS group_max
+            FROM totals
+        )
         INSERT INTO rating_winners (period_id, class_id, points)
-        SELECT $1, class_id, SUM(points)
-        FROM points_log
-        WHERE period_month = $2
-        GROUP BY class_id
-        HAVING SUM(points) = $3
+        SELECT $1, class_id, points
+        FROM ranked
+        WHERE points = group_max AND points > 0
         ON CONFLICT (period_id, class_id)
         DO UPDATE SET points = EXCLUDED.points
         """,
         period["id"],
         period_month,
-        maximum,
     )
 
 
@@ -1262,11 +1327,16 @@ async def close_due_rating_periods(
         today = moscow_today()
         rows = await connection.fetch(
             """
-            SELECT period_month FROM rating_periods WHERE status = 'open'
+            SELECT period_month, status FROM rating_periods
             """
         )
         for row in rows:
             period_month = row["period_month"]
+            if row["status"] == "closed":
+                # Перестраивает победителей по трём возрастным группам,
+                # включая месяцы, закрытые до обновления бота.
+                await refresh_period_winners(connection, period_month)
+                continue
             if today <= report_deadline(period_month):
                 continue
             await connection.execute(
@@ -1361,6 +1431,7 @@ async def get_current_month_value() -> str | None:
 async def _list_period_rating(
     connection: asyncpg.Connection,
     period_month: date,
+    age_group: str | None = None,
 ) -> list[tuple[str, str, int, bool]]:
     rows = await connection.fetch(
         """
@@ -1379,9 +1450,11 @@ async def _list_period_rating(
         LEFT JOIN rating_winners
             ON rating_winners.period_id = rating_periods.id
            AND rating_winners.class_id = classes.id
+        WHERE ($2::text IS NULL OR classes.age_group = $2)
         ORDER BY points DESC, classes.age_group, classes.name
         """,
         period_month,
+        age_group,
     )
     return [
         (row["name"], row["age_group"], row["points"], row["is_winner"])
@@ -1389,7 +1462,9 @@ async def _list_period_rating(
     ]
 
 
-async def list_current_month_rating() -> tuple[date, str | None, list[tuple[str, str, int, bool]]]:
+async def list_current_month_rating(
+    age_group: str | None = None,
+) -> tuple[date, str | None, list[tuple[str, str, int, bool]]]:
     connection = await asyncpg.connect(get_database_url())
     try:
         await close_due_rating_periods(connection)
@@ -1398,12 +1473,14 @@ async def list_current_month_rating() -> tuple[date, str | None, list[tuple[str,
             "SELECT monthly_value FROM rating_periods WHERE period_month = $1",
             period_month,
         )
-        return period_month, value, await _list_period_rating(connection, period_month)
+        return period_month, value, await _list_period_rating(connection, period_month, age_group)
     finally:
         await connection.close()
 
 
-async def list_academic_year_rating() -> tuple[str, int, bool, list[tuple[str, str, int, bool]]]:
+async def list_academic_year_rating(
+    age_group: str | None = None,
+) -> tuple[str, int, bool, list[tuple[str, str, int, bool]]]:
     connection = await asyncpg.connect(get_database_url())
     try:
         await close_due_rating_periods(connection)
@@ -1434,19 +1511,23 @@ async def list_academic_year_rating() -> tuple[str, int, bool, list[tuple[str, s
                 WHERE period_month BETWEEN $1 AND $2
                 GROUP BY class_id
             ) totals ON totals.class_id = classes.id
+            WHERE ($3::text IS NULL OR classes.age_group = $3)
             ORDER BY points DESC, classes.age_group, classes.name
             """,
             start,
             end,
+            age_group,
         )
         rating = [
             (row["name"], row["age_group"], row["points"], False)
             for row in rows
         ]
         if complete and rating:
-            maximum = rating[0][2]
+            maxima: dict[str, int] = {}
+            for _name, group, points, _winner in rating:
+                maxima[group] = max(maxima.get(group, 0), points)
             rating = [
-                (name, age_group, points, points == maximum and points > 0)
+                (name, age_group, points, points == maxima[age_group] and points > 0)
                 for name, age_group, points, _ in rating
             ]
         return academic_year_label(today), int(closed_count), complete, rating
@@ -1454,7 +1535,9 @@ async def list_academic_year_rating() -> tuple[str, int, bool, list[tuple[str, s
         await connection.close()
 
 
-async def list_rating_history() -> list[tuple[date, str, list[str], int | None]]:
+async def list_rating_history(
+    age_group: str | None = None,
+) -> list[tuple[date, str, list[str], int | None]]:
     connection = await asyncpg.connect(get_database_url())
     try:
         await close_due_rating_periods(connection)
@@ -1468,11 +1551,19 @@ async def list_rating_history() -> list[tuple[date, str, list[str], int | None]]
             FROM rating_periods
             LEFT JOIN rating_winners
                 ON rating_winners.period_id = rating_periods.id
-            LEFT JOIN classes ON classes.id = rating_winners.class_id
+               AND (
+                   $1::text IS NULL
+                   OR rating_winners.class_id IN (
+                       SELECT id FROM classes WHERE age_group = $1
+                   )
+               )
+            LEFT JOIN classes
+                ON classes.id = rating_winners.class_id
             GROUP BY rating_periods.id, rating_periods.period_month,
                      rating_periods.monthly_value
             ORDER BY rating_periods.period_month DESC
-            """
+            """,
+            age_group,
         )
         return [
             (
@@ -1487,7 +1578,7 @@ async def list_rating_history() -> list[tuple[date, str, list[str], int | None]]
         await connection.close()
 
 
-async def get_month_rating(period_month: date):
+async def get_month_rating(period_month: date, age_group: str | None = None):
     connection = await asyncpg.connect(get_database_url())
     try:
         await close_due_rating_periods(connection)
@@ -1497,7 +1588,11 @@ async def get_month_rating(period_month: date):
         )
         if period is None:
             return None
-        return period["monthly_value"], period["status"], await _list_period_rating(connection, period_month)
+        return (
+            period["monthly_value"],
+            period["status"],
+            await _list_period_rating(connection, period_month, age_group),
+        )
     finally:
         await connection.close()
 
@@ -1518,7 +1613,10 @@ async def get_class_place(max_user_id: int) -> tuple[int, str, str, int] | None:
             WITH ranked_classes AS (
                 SELECT classes.id, classes.name, classes.age_group,
                        COALESCE(SUM(points_log.points), 0)::int AS points,
-                       RANK() OVER (ORDER BY COALESCE(SUM(points_log.points), 0) DESC) AS place
+                       RANK() OVER (
+                           PARTITION BY classes.age_group
+                           ORDER BY COALESCE(SUM(points_log.points), 0) DESC
+                       ) AS place
                 FROM classes
                 LEFT JOIN points_log
                     ON points_log.class_id = classes.id
@@ -1634,13 +1732,14 @@ async def create_idea(
         await connection.close()
 
 
-async def list_pending_ideas() -> list[tuple[int, str, str, str, str]]:
+async def list_pending_ideas() -> list[tuple[int, str, str, str, str, str]]:
     connection = await asyncpg.connect(get_database_url())
     try:
         rows = await connection.fetch(
             """
             SELECT ideas.id, ideas.title, ideas.description,
-                   ideas.target_group, classes.name AS class_name
+                   ideas.target_group, classes.name AS class_name,
+                   classes.age_group
             FROM ideas
             JOIN classes ON classes.id = ideas.author_class_id
             WHERE ideas.status = 'pending'
@@ -1648,7 +1747,14 @@ async def list_pending_ideas() -> list[tuple[int, str, str, str, str]]:
             """
         )
         return [
-            (row["id"], row["title"], row["description"], row["target_group"], row["class_name"])
+            (
+                row["id"],
+                row["title"],
+                row["description"],
+                row["target_group"],
+                row["class_name"],
+                row["age_group"],
+            )
             for row in rows
         ]
     finally:
