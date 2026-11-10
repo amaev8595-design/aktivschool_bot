@@ -41,6 +41,15 @@ def academic_year_label(value: date) -> str:
     return f"{start_year}/{start_year + 1}"
 
 
+def is_school_month(value: date) -> bool:
+    return value.month not in (6, 7, 8)
+
+
+async def lock_ratings(connection: asyncpg.Connection) -> None:
+    # All point writes and month closures use the same transaction lock.
+    await connection.execute("SELECT pg_advisory_xact_lock(62149023)")
+
+
 def created_month(value: datetime) -> date:
     if value.tzinfo is not None:
         value = value.astimezone(MOSCOW_TZ)
@@ -851,6 +860,8 @@ async def _report_period_status(
 ) -> str:
     """Проверяет, открыт ли календарный период для отправки отчёта."""
     await close_due_rating_periods(connection)
+    if event_date > moscow_today():
+        return "event_not_finished"
     period_month = month_start(event_date)
     row = await connection.fetchrow(
         "SELECT status FROM rating_periods WHERE period_month = $1",
@@ -1109,6 +1120,7 @@ async def moderate_report(
     connection = await asyncpg.connect(get_database_url())
     try:
         async with connection.transaction():
+            await lock_ratings(connection)
             row = await connection.fetchrow(
                 """
                 SELECT reports.id, reports.class_id, reports.status,
@@ -1245,31 +1257,45 @@ async def close_due_rating_periods(
     connection: asyncpg.Connection,
 ) -> None:
     """Закрывает месяцы после 5-го числа следующего месяца."""
-    today = moscow_today()
-    rows = await connection.fetch(
-        """
-        SELECT period_month
-        FROM rating_periods
-        WHERE status = 'open'
-        """
-    )
-    for row in rows:
-        period_month = row["period_month"]
-        if today <= report_deadline(period_month):
-            continue
-        await connection.execute(
+    async with connection.transaction():
+        await lock_ratings(connection)
+        today = moscow_today()
+        rows = await connection.fetch(
             """
-            UPDATE rating_periods
-            SET status = 'closed', closed_at = NOW()
-            WHERE period_month = $1 AND status = 'open'
-            """,
-            period_month,
+            SELECT period_month FROM rating_periods WHERE status = 'open'
+            """
         )
-        await refresh_period_winners(connection, period_month)
+        for row in rows:
+            period_month = row["period_month"]
+            if today <= report_deadline(period_month):
+                continue
+            await connection.execute(
+                """
+                UPDATE rating_periods
+                SET status = 'closed', closed_at = NOW()
+                WHERE period_month = $1 AND status = 'open'
+                """,
+                period_month,
+            )
+            await refresh_period_winners(connection, period_month)
+
+
+async def close_expired_months() -> None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await close_due_rating_periods(connection)
+    finally:
+        await connection.close()
 
 
 async def set_monthly_value(value: str) -> tuple[str, date]:
     """Открывает текущий календарный месяц и сохраняет его ценность."""
+    period_month = month_start(moscow_today())
+    if not is_school_month(period_month):
+        return "holidays", period_month
+    value = value.strip()
+    if not 1 <= len(value) <= 200:
+        return "invalid", period_month
     connection = await asyncpg.connect(get_database_url())
     try:
         async with connection.transaction():
@@ -1394,7 +1420,8 @@ async def list_academic_year_rating() -> tuple[str, int, bool, list[tuple[str, s
             start,
             end,
         )
-        complete = int(closed_count) == 9
+        # A school that starts using the bot mid-year must still get year winners.
+        complete = today > report_deadline(end)
         rows = await connection.fetch(
             """
             SELECT classes.name, classes.age_group,
@@ -1442,7 +1469,6 @@ async def list_rating_history() -> list[tuple[date, str, list[str], int | None]]
             LEFT JOIN rating_winners
                 ON rating_winners.period_id = rating_periods.id
             LEFT JOIN classes ON classes.id = rating_winners.class_id
-            WHERE rating_periods.status = 'closed'
             GROUP BY rating_periods.id, rating_periods.period_month,
                      rating_periods.monthly_value
             ORDER BY rating_periods.period_month DESC
@@ -1457,6 +1483,21 @@ async def list_rating_history() -> list[tuple[date, str, list[str], int | None]]
             )
             for row in rows
         ]
+    finally:
+        await connection.close()
+
+
+async def get_month_rating(period_month: date):
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await close_due_rating_periods(connection)
+        period = await connection.fetchrow(
+            "SELECT monthly_value, status FROM rating_periods WHERE period_month = $1",
+            period_month,
+        )
+        if period is None:
+            return None
+        return period["monthly_value"], period["status"], await _list_period_rating(connection, period_month)
     finally:
         await connection.close()
 
@@ -1542,6 +1583,14 @@ async def create_idea(
     connection = await asyncpg.connect(get_database_url())
     try:
         async with connection.transaction():
+            await lock_ratings(connection)
+            current_month = month_start(moscow_today())
+            opened = await connection.fetchval(
+                "SELECT status = 'open' FROM rating_periods WHERE period_month = $1",
+                current_month,
+            )
+            if not opened or not is_school_month(current_month):
+                return "period_not_open", None
             user = await connection.fetchrow(
                 "SELECT class_id FROM users WHERE max_user_id = $1",
                 max_user_id,
@@ -1558,9 +1607,12 @@ async def create_idea(
                        ), 3) AS idea_limit
                 FROM ideas
                 WHERE author_class_id = $1
-                  AND created_at >= date_trunc('month', NOW())
+                  AND (created_at AT TIME ZONE 'Europe/Moscow')::date >= $2
+                  AND (created_at AT TIME ZONE 'Europe/Moscow')::date < $3
                 """,
                 user["class_id"],
+                current_month,
+                next_month(current_month),
             )
             if limit_row["idea_count"] >= limit_row["idea_limit"]:
                 return "limit", None
@@ -1612,6 +1664,7 @@ async def moderate_idea(
     connection = await asyncpg.connect(get_database_url())
     try:
         async with connection.transaction():
+            await lock_ratings(connection)
             row = await connection.fetchrow(
                 """
                 SELECT id, author_class_id, status
@@ -1637,9 +1690,12 @@ async def moderate_idea(
                     FROM ideas
                     WHERE author_class_id = $1
                       AND status = 'approved'
-                      AND created_at >= date_trunc('month', NOW())
+                      AND (created_at AT TIME ZONE 'Europe/Moscow')::date >= $2
+                      AND (created_at AT TIME ZONE 'Europe/Moscow')::date < $3
                     """,
                     row["author_class_id"],
+                    created_month(row["created_at"]),
+                    next_month(created_month(row["created_at"])),
                 )
                 if limit_row["approved_count"] >= limit_row["approval_limit"]:
                     return False, "limit", None
@@ -1715,6 +1771,14 @@ async def award_prize(class_name: str, place: int, confirmer_id: int) -> tuple[b
     connection = await asyncpg.connect(get_database_url())
     try:
         async with connection.transaction():
+            await lock_ratings(connection)
+            current_month = month_start(moscow_today())
+            opened = await connection.fetchval(
+                "SELECT status = 'open' FROM rating_periods WHERE period_month = $1",
+                current_month,
+            )
+            if not opened or not is_school_month(current_month):
+                return False, None
             class_row = await connection.fetchrow(
                 "SELECT id FROM classes WHERE name = $1",
                 class_name,

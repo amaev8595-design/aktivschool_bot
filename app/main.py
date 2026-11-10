@@ -1,6 +1,7 @@
 import asyncio
+import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import date
 
 from fastapi import FastAPI
@@ -13,6 +14,7 @@ from db import (
     create_idea,
     create_event,
     create_report,
+    close_expired_months,
     create_teacher_application,
     create_teacher_invite,
     delete_class_if_empty,
@@ -29,6 +31,7 @@ from db import (
     get_user_role,
     get_user_class,
     get_current_month_value,
+    get_month_rating,
     get_report_submitter_id,
     initialize_database,
     list_classes_with_codes,
@@ -55,7 +58,7 @@ from db import (
 )
 from maxo import Bot, Dispatcher
 from maxo.routing.filters import Command, CommandStart
-from maxo.types import BotStarted, MessageCreated
+from maxo.types import BotStarted, MessageCreated, InlineKeyboardAttachmentRequest
 from maxo.transport.webhook.adapters.fastapi import FastApiWebAdapter
 from maxo.transport.webhook.engines.simple import SimpleEngine
 from maxo.transport.webhook.routing.static import StaticRouting
@@ -199,6 +202,23 @@ def options_keyboard(*labels: str):
     for label in labels:
         keyboard.add_message(text=label)
     return keyboard.adjust(1).build()
+
+
+async def answer_lines(message, lines: list[str], keyboard) -> None:
+    """Send the full ranking without exceeding MAX's message size."""
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > 3500:
+            chunks.append(current)
+            current = ""
+        current += ("\n" if current else "") + line
+    if current:
+        chunks.append(current)
+    for chunk in chunks[:-1]:
+        await message.answer(chunk)
+    if chunks:
+        await message.answer(chunks[-1], keyboard=keyboard)
 
 
 def report_actions_keyboard():
@@ -452,7 +472,10 @@ async def start_screen(user_id: int) -> tuple[str, object]:
 async def bot_started_handler(update: BotStarted) -> None:
     user_id = update.user.user_id
     text, keyboard = await start_screen(user_id)
-    await bot.send_message(user_id=user_id, text=text, keyboard=keyboard)
+    await bot.send_message(
+        user_id=user_id, text=text,
+        attachments=[InlineKeyboardAttachmentRequest.factory(keyboard)],
+    )
 
 
 @dispatcher.message_created(CommandStart())
@@ -593,6 +616,9 @@ async def echo_handler(message: MessageCreated) -> None:
                 idea["description"],
                 value,
             )
+            if idea_status == "period_not_open":
+                await message.answer("Месяц ещё не открыт. Администратор должен ввести ценность месяца.")
+                return
             if idea_status == "limit":
                 await message.answer(
                     "Лимит идей класса на текущий месяц исчерпан. "
@@ -1492,6 +1518,12 @@ async def echo_handler(message: MessageCreated) -> None:
                     "Новые отчёты больше не принимаются."
                 )
                 return
+            if result != "ok":
+                await message.answer(
+                    "Мероприятие ещё не состоялось." if result == "event_not_finished"
+                    else "Мероприятие не найдено. Откройте афишу заново."
+                )
+                return
             report_kind = (
                 "Исправленный отчёт"
                 if report_form.get("mode") == "revise"
@@ -1858,11 +1890,17 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer("У вас нет прав администратора.")
             return
         value = text.removeprefix("/setvalue").strip()
-        if not value:
+        if not 1 <= len(value) <= 200:
             await message.answer("Формат: /setvalue Текст ценности месяца")
             return
         await ensure_user_role(message.user_id, "admin")
         status, period_month = await set_monthly_value(value)
+        if status in {"holidays", "invalid"}:
+            await message.answer(
+                "Учебные месяцы — с сентября по май. Летние месяцы не открываются."
+                if status == "holidays" else "Введите ценность длиной от 1 до 200 символов."
+            )
+            return
         if status == "closed":
             await message.answer(
                 "Текущий календарный месяц уже закрыт. Изменить его ценность нельзя.",
@@ -1916,7 +1954,7 @@ async def echo_handler(message: MessageCreated) -> None:
             return
         awarded, points = await award_prize(parts[0], int(parts[1]), message.user_id)
         if not awarded:
-            await message.answer("Класс не найден. Проверьте название командой /classes.")
+            await message.answer("Проверьте название класса и откройте текущий месяц, введя его ценность.")
             return
         await message.answer(
             f"Классу {parts[0]} начислено {points} баллов за {parts[1]} место.",
@@ -2107,6 +2145,10 @@ async def echo_handler(message: MessageCreated) -> None:
         responses = {
             "not_bound": "Сначала привяжите пользователя к классу через /start.",
             "not_signed": "Ваш класс не записан на это мероприятие.",
+            "not_found": "Мероприятие не найдено.",
+            "event_not_finished": "Мероприятие ещё не состоялось.",
+            "period_not_open": "Месяц ещё не открыт: администратор должен ввести его ценность.",
+            "period_closed": "Срок сдачи отчётов за этот месяц завершён (5-е число включительно).",
             "class_already_reported": (
                 "Ваш класс уже отправлял отчёт по этому мероприятию. "
                 "Повторная подача невозможна."
@@ -2314,7 +2356,7 @@ async def echo_handler(message: MessageCreated) -> None:
             lines.append(
                 f"{current_rank}. {badge}{name} ({age_group}) — {points} баллов"
             )
-        await message.answer("\n".join(lines), keyboard=rating_keyboard(await is_admin_user(message.user_id)))
+        await answer_lines(message, lines, rating_keyboard(await is_admin_user(message.user_id)))
         return
 
     if text == "🏅 Рейтинг учебного года":
@@ -2336,18 +2378,18 @@ async def echo_handler(message: MessageCreated) -> None:
             lines.append(
                 f"{current_rank}. {badge}{name} ({age_group}) — {points} баллов"
             )
-        await message.answer("\n".join(lines), keyboard=rating_keyboard(await is_admin_user(message.user_id)))
+        await answer_lines(message, lines, rating_keyboard(await is_admin_user(message.user_id)))
         return
 
     if text == "📅 История рейтингов":
         history = await list_rating_history()
         if not history:
             await message.answer(
-                "Закрытых месяцев пока нет.",
+                "Открытых месяцев пока нет.",
                 keyboard=rating_keyboard(await is_admin_user(message.user_id)),
             )
             return
-        lines = ["📅 История рейтингов:"]
+        lines = ["📅 История рейтингов. Для полного списка нажмите месяц ниже или введите /rating ГГГГ-ММ."]
         for period_month, value, winners, winner_points in history:
             winner_text = ", ".join(winners) if winners else "победитель не определён"
             points_text = f" — {winner_points} баллов" if winner_points is not None else ""
@@ -2355,7 +2397,34 @@ async def echo_handler(message: MessageCreated) -> None:
                 f"\n{period_month.strftime('%m.%Y')} · {value}\n"
                 f"🏆 {winner_text}{points_text}"
             )
-        await message.answer("\n".join(lines), keyboard=rating_keyboard(await is_admin_user(message.user_id)))
+        await answer_lines(message, lines, options_keyboard(
+            *(f"📊 Месяц {row[0].strftime('%Y-%m')}" for row in history[:12]),
+            "🏆 Рейтинг",
+        ))
+        return
+
+    if text.startswith("📊 Месяц ") or text.startswith("/rating "):
+        raw_month = text.removeprefix("📊 Месяц ").removeprefix("/rating ").strip()
+        try:
+            period_month = date.fromisoformat(raw_month + "-01")
+        except ValueError:
+            await message.answer("Укажите месяц в формате /rating 2026-11.")
+            return
+        result = await get_month_rating(period_month)
+        if result is None:
+            await message.answer("Этот месяц ещё не открывался.")
+            return
+        value, status, rating = result
+        lines = [f"📊 Рейтинг за {period_month.strftime('%m.%Y')} · {value}"]
+        lines.append("Месяц закрыт. 🏆 — победители." if status == "closed" else "Приём отчётов ещё открыт до 5-го числа следующего месяца.")
+        lines.append("Своевременно сданные отчёты учитываются после проверки; итоги могут уточняться.")
+        last_points, rank = None, 0
+        for position, (name, age_group, points, winner) in enumerate(rating, 1):
+            if points != last_points:
+                rank, last_points = position, points
+            badge = "🏆 " if winner else ""
+            lines.append(f"{rank}. {badge}{name} ({age_group}) — {points} баллов")
+        await answer_lines(message, lines, rating_keyboard(await is_admin_user(message.user_id)))
         return
 
     if text == "📍 Место":
@@ -2428,6 +2497,33 @@ async def prepare_database() -> None:
     print("PostgreSQL подключён, схема базы данных проверена.")
 
 
+@asynccontextmanager
+async def rating_maintenance():
+    # Catch up after downtime before accepting updates, then check every minute.
+    await close_expired_months()
+
+    async def check_deadlines():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await close_expired_months()
+            except Exception as error:
+                logging.error("Не удалось закрыть месяц (%s), повтор через минуту", type(error).__name__)
+
+    task = asyncio.create_task(check_deadlines())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def run_polling() -> None:
+    async with rating_maintenance():
+        await dispatcher.start_polling(bot, clear_subscriptions=True)
+
+
 def build_webhook_app() -> tuple[FastAPI | None, SimpleEngine | None]:
     if BOT_MODE != "webhook":
         if BOT_MODE != "polling":
@@ -2450,7 +2546,8 @@ def build_webhook_app() -> tuple[FastAPI | None, SimpleEngine | None]:
         await engine.set_webhook(update_types=["message_created", "bot_started"])
         print(f"Webhook подключён: {public_url}")
         try:
-            yield
+            async with rating_maintenance():
+                yield
         finally:
             await engine.on_shutdown(app)
 
@@ -2471,5 +2568,5 @@ if __name__ == "__main__":
             port=int(os.getenv("WEBHOOK_PORT", "8080")),
         )
     else:
-        dispatcher.run_polling(bot, clear_subscriptions=True)
+        asyncio.run(run_polling())
 

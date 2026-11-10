@@ -116,6 +116,18 @@ CREATE TABLE IF NOT EXISTS points_log (
 );
 
 ALTER TABLE points_log ADD COLUMN IF NOT EXISTS period_month DATE;
+-- Old report/idea awards carry their source ID in the reason. Preserve the
+-- activity month instead of the date on which the moderator approved it.
+UPDATE points_log AS p
+SET period_month = date_trunc('month', e.event_date)::date
+FROM reports r JOIN events e ON e.id = r.event_id
+WHERE p.period_month IS NULL
+  AND p.reason = 'Отчёт №' || r.id || ' подтверждён';
+UPDATE points_log AS p
+SET period_month = date_trunc('month', i.created_at AT TIME ZONE 'Europe/Moscow')::date
+FROM ideas i
+WHERE p.period_month IS NULL
+  AND p.reason = 'Идея №' || i.id || ' прошла модерацию';
 UPDATE points_log
 SET period_month = date_trunc('month', created_at AT TIME ZONE 'Europe/Moscow')::date
 WHERE period_month IS NULL;
@@ -124,6 +136,7 @@ ALTER TABLE points_log
         'month', timezone('Europe/Moscow', NOW())
     )::date);
 ALTER TABLE points_log ALTER COLUMN period_month SET NOT NULL;
+CREATE INDEX IF NOT EXISTS points_log_month_class_idx ON points_log (period_month, class_id);
 
 CREATE TABLE IF NOT EXISTS rating_periods (
     id BIGSERIAL PRIMARY KEY,
@@ -144,6 +157,14 @@ CREATE TABLE IF NOT EXISTS rating_winners (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (period_id, class_id)
 );
+
+-- Keep earlier activity visible in history without inventing monthly values.
+INSERT INTO rating_periods (period_month, monthly_value)
+SELECT DISTINCT period_month, 'Ценность не указана (до обновления)'
+FROM points_log
+WHERE period_month < date_trunc('month', timezone('Europe/Moscow', NOW()))::date
+  AND EXTRACT(MONTH FROM period_month) NOT IN (6, 7, 8)
+ON CONFLICT (period_month) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
