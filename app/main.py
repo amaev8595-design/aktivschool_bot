@@ -46,6 +46,7 @@ from db import (
     list_pending_ideas,
     list_academic_year_rating,
     list_current_month_rating,
+    list_recent_rating_actions,
     list_rating_history,
     list_signed_up_events,
     list_teacher_invites,
@@ -60,6 +61,7 @@ from db import (
     set_monthly_value,
     set_setting,
     signup_for_event,
+    undo_rating_action,
 )
 from maxo import Bot, Dispatcher
 from maxo.routing.filters import Command, CommandStart
@@ -188,10 +190,11 @@ def admin_keyboard():
         .add_message(text="❌ Отклонить отчёт")
         .add_message(text="🏅 Призовые баллы")
         .add_message(text="🎁 Дополнительные баллы")
+        .add_message(text="🧾 Журнал начислений")
         .add_message(text="⚙️ Лимиты")
         .add_message(text="↩️ Главное меню")
     )
-    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1).build()
+    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1).build()
 
 
 def class_group_keyboard():
@@ -1249,6 +1252,121 @@ async def echo_handler(message: MessageCreated) -> None:
         if value == "↩️ Отмена":
             pending_admin_forms.pop(message.user_id, None)
             await message.answer("Текущая форма отменена.", keyboard=admin_keyboard())
+            return
+
+        if form.get("kind") == "rating_audit_undo":
+            if form["step"] == "id":
+                if not value.isdigit():
+                    await message.answer(
+                        "Введите числовой номер записи из журнала или нажмите «↩️ Отмена».",
+                        keyboard=cancel_keyboard(),
+                    )
+                    return
+                actions = await list_recent_rating_actions(message.user_id, limit=15)
+                selected = next(
+                    (action for action in actions if int(action["id"]) == int(value)),
+                    None,
+                )
+                if selected is None:
+                    await message.answer(
+                        "Такого номера нет в показанном журнале. Откройте журнал заново.",
+                        keyboard=admin_keyboard(),
+                    )
+                    pending_admin_forms.pop(message.user_id, None)
+                    return
+                if selected["reversed_at"] is not None:
+                    await message.answer("Эта запись уже была отменена.", keyboard=admin_keyboard())
+                    pending_admin_forms.pop(message.user_id, None)
+                    return
+                if not selected["can_undo"]:
+                    await message.answer(
+                        "Эту запись нельзя отменить раньше более нового изменения "
+                        "того же показателя. Сначала отмените новую запись.",
+                        keyboard=admin_keyboard(),
+                    )
+                    pending_admin_forms.pop(message.user_id, None)
+                    return
+                form["action_id"] = value
+                form["action_type"] = selected["action_type"]
+                form["step"] = "confirm"
+                category_labels = {
+                    "punctuality": "Пунктуальность",
+                    "attendance": "Посещаемость",
+                    "discipline": "Дисциплина",
+                    "tidiness": "Опрятность и форма",
+                }
+                if selected["action_type"] == "bonus":
+                    before = (
+                        str(selected["previous_points"])
+                        if selected["had_bonus"]
+                        else "начисления не было"
+                    )
+                    change_detail = (
+                        f"Бонус изменится с {selected['new_points']} на {before} баллов."
+                    )
+                else:
+                    change_detail = "Замечание учителя будет удалено."
+                    if selected["had_bonus"]:
+                        change_detail += (
+                            f" Бонус по дисциплине восстановится с "
+                            f"{selected['new_points']} до {selected['previous_points']} баллов."
+                        )
+                await message.answer(
+                    f"Отменить запись №{value} для класса {selected['class_name']} "
+                    f"за {category_labels[selected['category']]}?\n{change_detail}\n"
+                    "После отмены рейтинг будет пересчитан.",
+                    keyboard=confirmation_keyboard("↩️ Подтвердить отмену"),
+                )
+                return
+            if value == "✏️ Изменить":
+                form["step"] = "id"
+                await message.answer(
+                    "Введите номер записи из журнала:",
+                    keyboard=cancel_keyboard(),
+                )
+                return
+            if value != "↩️ Подтвердить отмену":
+                await message.answer(
+                    "Подтвердите отмену кнопкой или нажмите «✏️ Изменить».",
+                    keyboard=confirmation_keyboard("↩️ Подтвердить отмену"),
+                )
+                return
+            status, class_name, category, previous_points, new_points = await undo_rating_action(
+                message.user_id,
+                int(form["action_id"]),
+            )
+            pending_admin_forms.pop(message.user_id, None)
+            if status == "ok":
+                if form["action_type"] == "bonus" and previous_points is None:
+                    detail = f" Начисление {new_points} баллов удалено."
+                elif previous_points is not None and new_points is not None:
+                    detail = f" Баллы восстановлены: {new_points} → {previous_points}."
+                else:
+                    detail = " Само замечание удалено; начисленный бонус не менялся."
+                await message.answer(
+                    f"Запись №{form['action_id']} отменена для класса {class_name} "
+                    f"(показатель: {category}).{detail} Рейтинг пересчитан.",
+                    keyboard=admin_keyboard(),
+                )
+            else:
+                messages = {
+                    "not_found": "Запись не найдена.",
+                    "already_undone": "Эта запись уже была отменена.",
+                    "class_missing": "Класс удалён, поэтому отменить запись нельзя.",
+                    "newer_action_exists": (
+                        "Эту запись нельзя отменить раньше более нового изменения "
+                        "того же показателя. Отмените сначала новую запись."
+                    ),
+                    "state_changed": (
+                        "Текущее состояние уже отличается от этой записи. "
+                        "Ничего не изменено; обновите журнал."
+                    ),
+                    "not_admin": "Отменять записи может только администратор.",
+                }
+                await message.answer(
+                    messages.get(status, "Не удалось отменить запись."),
+                    keyboard=admin_keyboard(),
+                )
             return
 
         if form.get("kind") == "deleteclass":
@@ -2378,6 +2496,71 @@ async def echo_handler(message: MessageCreated) -> None:
             "Выберите тип лимита:",
         ),
     }
+
+    if text == "🧾 Журнал начислений":
+        if not await is_admin_user(message.user_id):
+            await message.answer("Раздел доступен только администраторам.")
+            return
+        actions = await list_recent_rating_actions(message.user_id, limit=15)
+        if not actions:
+            pending_admin_actions.pop(message.user_id, None)
+            await message.answer(
+                "Журнал пока пуст: дополнительных начислений и замечаний ещё не было.",
+                keyboard=admin_keyboard(),
+            )
+            return
+
+        category_labels = {
+            key: label for key, label, _limit in BONUS_CATEGORY_BUTTONS.values()
+        }
+        lines = ["🧾 Последние начисления и замечания:"]
+        for action in actions:
+            status_label = (
+                "↩️ уже отменена"
+                if action["reversed_at"] is not None
+                else ("✅ можно отменить" if action["can_undo"] else "🔒 есть более новое изменение")
+            )
+            period_label = action["period_month"].strftime("%Y-%m")
+            if action["action_type"] == "bonus":
+                old_value = (
+                    str(action["previous_points"])
+                    if action["had_bonus"]
+                    else "не было"
+                )
+                description = (
+                    f"Бонус «{category_labels[action['category']]}»: "
+                    f"{old_value} → {action['new_points']} баллов"
+                )
+            else:
+                description = "Замечание учителя"
+                if action["had_bonus"]:
+                    description += (
+                        f"; дисциплина: {action['previous_points']} → "
+                        f"{action['new_points']} баллов"
+                    )
+                if action["note"]:
+                    note = action["note"]
+                    if len(note) > 80:
+                        note = note[:77] + "…"
+                    description += f"; {note}"
+            lines.append(
+                f"\n№{action['id']} · {period_label} · {action['class_name']}\n"
+                f"{description}\n"
+                f"Автор ID {action['actor_max_user_id']} · {status_label}"
+            )
+
+        pending_admin_actions.pop(message.user_id, None)
+        pending_admin_forms[message.user_id] = {
+            "kind": "rating_audit_undo",
+            "step": "id",
+        }
+        await message.answer(
+            "\n".join(lines)
+            + "\n\nВведите номер записи, которую нужно отменить. "
+            "Отменить можно только последнее изменение показателя для этого класса и месяца.",
+            keyboard=cancel_keyboard(),
+        )
+        return
 
     if text in admin_form_starters:
         if not await is_admin_user(message.user_id):

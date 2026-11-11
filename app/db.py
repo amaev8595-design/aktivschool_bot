@@ -2272,6 +2272,24 @@ async def award_monthly_bonus(
                     class_row["id"],
                     delta,
                 )
+            await connection.execute(
+                """
+                INSERT INTO rating_action_audit (
+                    action_type, class_id, class_name, period_month, category,
+                    actor_max_user_id, event_ref_id, had_bonus,
+                    previous_points, new_points
+                ) VALUES ('bonus', $1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                class_row["id"],
+                class_name,
+                current_month,
+                category,
+                admin_max_user_id,
+                points_log_id,
+                existing is not None,
+                previous_points if existing is not None else None,
+                points,
+            )
             await refresh_period_winners(connection, current_month)
             return "ok", int(penalty_count), cap
     finally:
@@ -2318,11 +2336,12 @@ async def add_discipline_penalty(
             if not period_open or not is_school_month(current_month):
                 return "period_not_open", 0, 0, 0
 
-            await connection.execute(
+            penalty_id = await connection.fetchval(
                 """
                 INSERT INTO discipline_penalties (
                     class_id, period_month, teacher_max_user_id, note
                 ) VALUES ($1, $2, $3, $4)
+                RETURNING id
                 """,
                 class_row["id"],
                 current_month,
@@ -2349,9 +2368,12 @@ async def add_discipline_penalty(
                 current_month,
             )
             deducted = 0
+            previous_points = int(bonus["points"]) if bonus is not None else None
+            new_points = previous_points
             if bonus is not None and int(bonus["points"]) > cap:
                 previous_points = int(bonus["points"])
                 deducted = previous_points - cap
+                new_points = cap
                 await connection.execute(
                     """
                     UPDATE monthly_class_bonuses
@@ -2378,8 +2400,266 @@ async def add_discipline_penalty(
                     class_row["id"],
                     deducted,
                 )
+            await connection.execute(
+                """
+                INSERT INTO rating_action_audit (
+                    action_type, class_id, class_name, period_month, category,
+                    actor_max_user_id, event_ref_id, had_bonus,
+                    previous_points, new_points, note
+                ) VALUES ('penalty', $1, $2, $3, 'discipline', $4, $5, $6, $7, $8, $9)
+                """,
+                class_row["id"],
+                class_name,
+                current_month,
+                teacher_max_user_id,
+                penalty_id,
+                bonus is not None,
+                previous_points,
+                new_points,
+                note,
+            )
             await refresh_period_winners(connection, current_month)
             return "ok", penalty_count, cap, deducted
+    finally:
+        await connection.close()
+
+
+async def list_recent_rating_actions(
+    admin_max_user_id: int,
+    limit: int = 20,
+) -> list[asyncpg.Record]:
+    """List bonus and penalty changes with a safe-to-undo indicator."""
+    if (
+        admin_max_user_id not in get_admin_ids()
+        and await get_user_role(admin_max_user_id) != "admin"
+    ):
+        return []
+
+    limit = max(1, min(limit, 50))
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        return await connection.fetch(
+            """
+            SELECT audit.id, audit.action_type, audit.class_name,
+                   audit.period_month, audit.category,
+                   audit.actor_max_user_id, audit.had_bonus,
+                   audit.previous_points, audit.new_points, audit.note,
+                   audit.created_at, audit.reversed_at,
+                   (
+                       audit.reversed_at IS NULL
+                       AND audit.class_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM rating_action_audit newer
+                           WHERE newer.class_id = audit.class_id
+                             AND newer.period_month = audit.period_month
+                             AND newer.category = audit.category
+                             AND newer.id > audit.id
+                             AND newer.reversed_at IS NULL
+                       )
+                   ) AS can_undo
+            FROM rating_action_audit audit
+            ORDER BY audit.id DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    finally:
+        await connection.close()
+
+
+async def undo_rating_action(
+    admin_max_user_id: int,
+    action_id: int,
+) -> tuple[str, str | None, str | None, int | None, int | None]:
+    """Undo the latest change for a class/month/category and preserve its audit."""
+    if (
+        admin_max_user_id not in get_admin_ids()
+        and await get_user_role(admin_max_user_id) != "admin"
+    ):
+        return "not_admin", None, None, None, None
+
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            await lock_ratings(connection)
+            action = await connection.fetchrow(
+                """
+                SELECT * FROM rating_action_audit
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                action_id,
+            )
+            if action is None:
+                return "not_found", None, None, None, None
+            if action["reversed_at"] is not None:
+                return "already_undone", action["class_name"], action["category"], None, None
+            if action["class_id"] is None:
+                return "class_missing", action["class_name"], action["category"], None, None
+
+            newer_action = await connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM rating_action_audit
+                    WHERE class_id = $1 AND period_month = $2 AND category = $3
+                      AND id > $4 AND reversed_at IS NULL
+                )
+                """,
+                action["class_id"],
+                action["period_month"],
+                action["category"],
+                action_id,
+            )
+            if newer_action:
+                return "newer_action_exists", action["class_name"], action["category"], None, None
+
+            class_id = action["class_id"]
+            previous_points = action["previous_points"]
+            new_points = action["new_points"]
+            if action["action_type"] == "bonus":
+                bonus = await connection.fetchrow(
+                    """
+                    SELECT points, points_log_id
+                    FROM monthly_class_bonuses
+                    WHERE class_id = $1 AND period_month = $2 AND category = $3
+                    FOR UPDATE
+                    """,
+                    class_id,
+                    action["period_month"],
+                    action["category"],
+                )
+                if bonus is None or int(bonus["points"]) != int(new_points):
+                    return "state_changed", action["class_name"], action["category"], None, None
+
+                if action["had_bonus"]:
+                    restored_points = int(previous_points)
+                    await connection.execute(
+                        """
+                        UPDATE monthly_class_bonuses
+                        SET points = $4, updated_by_max_user_id = $5, updated_at = NOW()
+                        WHERE class_id = $1 AND period_month = $2 AND category = $3
+                        """,
+                        class_id,
+                        action["period_month"],
+                        action["category"],
+                        restored_points,
+                        admin_max_user_id,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE points_log
+                        SET points = $2, reason = $3,
+                            confirmed_by = (SELECT id FROM users WHERE max_user_id = $4)
+                        WHERE id = $1
+                        """,
+                        bonus["points_log_id"],
+                        restored_points,
+                        f"Ежемесячный бонус: {MONTHLY_BONUS_LABELS[action['category']]}",
+                        admin_max_user_id,
+                    )
+                else:
+                    restored_points = 0
+                    await connection.execute(
+                        """
+                        DELETE FROM monthly_class_bonuses
+                        WHERE class_id = $1 AND period_month = $2 AND category = $3
+                        """,
+                        class_id,
+                        action["period_month"],
+                        action["category"],
+                    )
+
+                delta = restored_points - int(new_points)
+                if delta:
+                    await connection.execute(
+                        "UPDATE classes SET points = points + $2 WHERE id = $1",
+                        class_id,
+                        delta,
+                    )
+            else:
+                penalty_exists = await connection.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM discipline_penalties
+                        WHERE id = $1 AND class_id = $2 AND period_month = $3
+                    )
+                    """,
+                    action["event_ref_id"],
+                    class_id,
+                    action["period_month"],
+                )
+                if not penalty_exists:
+                    return "state_changed", action["class_name"], action["category"], None, None
+
+                if action["had_bonus"]:
+                    bonus = await connection.fetchrow(
+                        """
+                        SELECT points, points_log_id
+                        FROM monthly_class_bonuses
+                        WHERE class_id = $1 AND period_month = $2 AND category = 'discipline'
+                        FOR UPDATE
+                        """,
+                        class_id,
+                        action["period_month"],
+                    )
+                    if bonus is None or int(bonus["points"]) != int(new_points):
+                        return "state_changed", action["class_name"], action["category"], None, None
+
+                await connection.execute(
+                    "DELETE FROM discipline_penalties WHERE id = $1",
+                    action["event_ref_id"],
+                )
+                if action["had_bonus"]:
+                    restored_points = int(previous_points)
+                    await connection.execute(
+                        """
+                        UPDATE monthly_class_bonuses
+                        SET points = $3, updated_by_max_user_id = $4, updated_at = NOW()
+                        WHERE class_id = $1 AND period_month = $2 AND category = 'discipline'
+                        """,
+                        class_id,
+                        action["period_month"],
+                        restored_points,
+                        admin_max_user_id,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE points_log
+                        SET points = $2,
+                            reason = 'Ежемесячный бонус: Дисциплина (после отмены замечания)',
+                            confirmed_by = (SELECT id FROM users WHERE max_user_id = $3)
+                        WHERE id = $1
+                        """,
+                        bonus["points_log_id"],
+                        restored_points,
+                        admin_max_user_id,
+                    )
+                    delta = restored_points - int(new_points)
+                    if delta:
+                        await connection.execute(
+                            "UPDATE classes SET points = points + $2 WHERE id = $1",
+                            class_id,
+                            delta,
+                        )
+
+            await connection.execute(
+                """
+                UPDATE rating_action_audit
+                SET reversed_at = NOW(), reversed_by_max_user_id = $2
+                WHERE id = $1
+                """,
+                action_id,
+                admin_max_user_id,
+            )
+            await refresh_period_winners(connection, action["period_month"])
+            return (
+                "ok",
+                action["class_name"],
+                action["category"],
+                int(previous_points) if previous_points is not None else None,
+                int(new_points) if new_points is not None else None,
+            )
     finally:
         await connection.close()
 

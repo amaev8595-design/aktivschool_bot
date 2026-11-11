@@ -167,6 +167,30 @@ CREATE TABLE IF NOT EXISTS discipline_penalties (
 CREATE INDEX IF NOT EXISTS discipline_penalties_class_month_idx
     ON discipline_penalties (class_id, period_month);
 
+CREATE TABLE IF NOT EXISTS rating_action_audit (
+    id BIGSERIAL PRIMARY KEY,
+    action_type TEXT NOT NULL CHECK (action_type IN ('bonus', 'penalty')),
+    class_id BIGINT REFERENCES classes(id) ON DELETE SET NULL,
+    class_name TEXT NOT NULL,
+    period_month DATE NOT NULL,
+    category TEXT NOT NULL CHECK (
+        category IN ('punctuality', 'attendance', 'discipline', 'tidiness')
+    ),
+    actor_max_user_id BIGINT NOT NULL,
+    event_ref_id BIGINT NOT NULL,
+    had_bonus BOOLEAN NOT NULL DEFAULT FALSE,
+    previous_points INTEGER,
+    new_points INTEGER,
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reversed_at TIMESTAMPTZ,
+    reversed_by_max_user_id BIGINT,
+    CHECK (period_month = date_trunc('month', period_month)::date)
+);
+
+CREATE INDEX IF NOT EXISTS rating_action_audit_class_period_idx
+    ON rating_action_audit (class_id, period_month, category, id DESC);
+
 ALTER TABLE points_log ADD COLUMN IF NOT EXISTS period_month DATE;
 -- Old report/idea awards carry their source ID in the reason. Preserve the
 -- activity month instead of the date on which the moderator approved it.

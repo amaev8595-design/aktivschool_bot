@@ -14,6 +14,33 @@ services:
       timeout: 5s
       retries: 10
 
+  db-backup:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      PGHOST: db
+      PGUSER: aktiv
+      PGDATABASE: aktiv
+      PGPASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >-
+      sh -c 'while true; do
+        file="/backups/aktiv-$$(date -u +%Y%m%dT%H%M%SZ).dump";
+        if pg_dump -Fc -f "$$file"; then
+          find /backups -maxdepth 1 -type f -name "aktiv-*.dump" -mtime +14 -delete;
+          echo "Database backup created: $$file";
+        else
+          rm -f "$$file";
+          echo "Database backup failed" >&2;
+          sleep 300;
+        fi;
+        if [ -f "$$file" ]; then sleep 86400; fi;
+      done'
+
   app:
     build:
       context: .
@@ -47,6 +74,7 @@ services:
 
 volumes:
   pgdata:
+  db_backups:
   caddy_data:
   caddy_config:
 
