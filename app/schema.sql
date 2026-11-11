@@ -43,6 +43,30 @@ CREATE TABLE IF NOT EXISTS teacher_applications (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS teacher_class_assignments (
+    teacher_max_user_id BIGINT NOT NULL REFERENCES users(max_user_id) ON DELETE CASCADE,
+    class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (teacher_max_user_id, class_id)
+);
+
+CREATE TABLE IF NOT EXISTS teacher_application_classes (
+    application_id BIGINT NOT NULL REFERENCES teacher_applications(id) ON DELETE CASCADE,
+    class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+    PRIMARY KEY (application_id, class_id)
+);
+
+CREATE INDEX IF NOT EXISTS teacher_class_assignments_class_idx
+    ON teacher_class_assignments (class_id);
+CREATE INDEX IF NOT EXISTS teacher_application_classes_class_idx
+    ON teacher_application_classes (class_id);
+
+INSERT INTO teacher_class_assignments (teacher_max_user_id, class_id)
+SELECT max_user_id, class_id
+FROM users
+WHERE role = 'teacher' AND class_id IS NOT NULL
+ON CONFLICT DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS ideas (
     id BIGSERIAL PRIMARY KEY,
     title TEXT NOT NULL,
@@ -114,6 +138,34 @@ CREATE TABLE IF NOT EXISTS points_log (
     confirmed_by BIGINT REFERENCES users(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS monthly_class_bonuses (
+    id BIGSERIAL PRIMARY KEY,
+    class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+    period_month DATE NOT NULL,
+    category TEXT NOT NULL CHECK (
+        category IN ('punctuality', 'attendance', 'discipline', 'tidiness')
+    ),
+    points INTEGER NOT NULL CHECK (points >= 0),
+    points_log_id BIGINT NOT NULL UNIQUE REFERENCES points_log(id) ON DELETE CASCADE,
+    updated_by_max_user_id BIGINT REFERENCES users(max_user_id) ON DELETE SET NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (class_id, period_month, category),
+    CHECK (period_month = date_trunc('month', period_month)::date)
+);
+
+CREATE TABLE IF NOT EXISTS discipline_penalties (
+    id BIGSERIAL PRIMARY KEY,
+    class_id BIGINT NOT NULL REFERENCES classes(id) ON DELETE CASCADE,
+    period_month DATE NOT NULL,
+    teacher_max_user_id BIGINT NOT NULL REFERENCES users(max_user_id) ON DELETE CASCADE,
+    note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (period_month = date_trunc('month', period_month)::date)
+);
+
+CREATE INDEX IF NOT EXISTS discipline_penalties_class_month_idx
+    ON discipline_penalties (class_id, period_month);
 
 ALTER TABLE points_log ADD COLUMN IF NOT EXISTS period_month DATE;
 -- Old report/idea awards carry their source ID in the reason. Preserve the

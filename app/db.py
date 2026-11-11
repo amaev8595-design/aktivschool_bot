@@ -127,6 +127,27 @@ async def get_user_class(max_user_id: int) -> tuple[str, str] | None:
         await connection.close()
 
 
+async def list_teacher_assigned_classes(
+    teacher_max_user_id: int,
+) -> list[tuple[str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT classes.name, classes.age_group
+            FROM teacher_class_assignments
+            JOIN classes ON classes.id = teacher_class_assignments.class_id
+            WHERE teacher_class_assignments.teacher_max_user_id = $1
+              AND classes.archived = FALSE
+            ORDER BY classes.age_group, classes.name
+            """,
+            teacher_max_user_id,
+        )
+        return [(row["name"], row["age_group"]) for row in rows]
+    finally:
+        await connection.close()
+
+
 async def bind_user_to_class(max_user_id: int, invite_code: str) -> tuple[str, str] | None:
     connection = await asyncpg.connect(get_database_url())
     try:
@@ -198,6 +219,22 @@ async def set_user_role(max_user_id: int, role: str) -> None:
             max_user_id,
             role,
         )
+        if role == "teacher":
+            await connection.execute(
+                """
+                INSERT INTO teacher_class_assignments (teacher_max_user_id, class_id)
+                SELECT max_user_id, class_id
+                FROM users
+                WHERE max_user_id = $1 AND class_id IS NOT NULL
+                ON CONFLICT DO NOTHING
+                """,
+                max_user_id,
+            )
+        else:
+            await connection.execute(
+                "DELETE FROM teacher_class_assignments WHERE teacher_max_user_id = $1",
+                max_user_id,
+            )
     finally:
         await connection.close()
 
@@ -228,7 +265,18 @@ async def list_users_with_details() -> list[tuple[int, str, str | None, str | No
             """
             SELECT users.max_user_id,
                    users.role,
-                   classes.name AS class_name,
+                   COALESCE(
+                       (
+                           SELECT string_agg(assigned_classes.name, ', '
+                                             ORDER BY assigned_classes.name)
+                           FROM teacher_class_assignments
+                           JOIN classes AS assigned_classes
+                             ON assigned_classes.id = teacher_class_assignments.class_id
+                           WHERE teacher_class_assignments.teacher_max_user_id = users.max_user_id
+                             AND assigned_classes.archived = FALSE
+                       ),
+                       classes.name
+                   ) AS class_name,
                    teacher_applications.full_name,
                    teacher_applications.subject
             FROM users
@@ -373,13 +421,15 @@ async def create_teacher_application(
     full_name: str,
     subject: str,
     invite_code: str,
+    class_names: list[str] | None = None,
 ) -> tuple[str, int | None, str | None]:
     connection = await asyncpg.connect(get_database_url())
     try:
         async with connection.transaction():
             invite = await connection.fetchrow(
                 """
-                SELECT teacher_invites.id, classes.name AS class_name
+                SELECT teacher_invites.id, teacher_invites.class_id,
+                       classes.name AS class_name
                 FROM teacher_invites
                 JOIN classes ON classes.id = teacher_invites.class_id
                 WHERE teacher_invites.code = $1
@@ -391,6 +441,24 @@ async def create_teacher_application(
             )
             if invite is None:
                 return "invalid_code", None, None
+
+            selected_names = set(class_names or [invite["class_name"]])
+            selected_names.add(invite["class_name"])
+            selected_classes = await connection.fetch(
+                """
+                SELECT id, name
+                FROM classes
+                WHERE name = ANY($1::text[]) AND archived = FALSE
+                ORDER BY age_group, name
+                """,
+                list(selected_names),
+            )
+            if (
+                len(selected_classes) != len(selected_names)
+                or int(invite["class_id"])
+                not in {int(row["id"]) for row in selected_classes}
+            ):
+                return "invalid_classes", None, invite["class_name"]
 
             existing = await connection.fetchrow(
                 """
@@ -453,6 +521,18 @@ async def create_teacher_application(
                     subject,
                     invite["id"],
                 )
+            await connection.execute(
+                "DELETE FROM teacher_application_classes WHERE application_id = $1",
+                application["id"],
+            )
+            await connection.executemany(
+                """
+                INSERT INTO teacher_application_classes (application_id, class_id)
+                VALUES ($1, $2)
+                ON CONFLICT DO NOTHING
+                """,
+                [(application["id"], row["id"]) for row in selected_classes],
+            )
             return "ok", int(application["id"]), invite["class_name"]
     finally:
         await connection.close()
@@ -465,11 +545,22 @@ async def list_pending_teacher_applications() -> list[tuple[int, int, str, str, 
             """
             SELECT teacher_applications.id, teacher_applications.max_user_id,
                    teacher_applications.full_name, teacher_applications.subject,
-                   classes.name AS class_name
+                   COALESCE(
+                       string_agg(DISTINCT assigned_classes.name, ', '
+                                  ORDER BY assigned_classes.name),
+                       classes.name
+                   ) AS class_name
             FROM teacher_applications
             JOIN teacher_invites ON teacher_invites.id = teacher_applications.invite_id
             JOIN classes ON classes.id = teacher_invites.class_id
+            LEFT JOIN teacher_application_classes
+                ON teacher_application_classes.application_id = teacher_applications.id
+            LEFT JOIN classes AS assigned_classes
+                ON assigned_classes.id = teacher_application_classes.class_id
             WHERE teacher_applications.status = 'pending'
+            GROUP BY teacher_applications.id, teacher_applications.max_user_id,
+                     teacher_applications.full_name, teacher_applications.subject,
+                     classes.name
             ORDER BY teacher_applications.created_at, teacher_applications.id
             """
         )
@@ -527,6 +618,24 @@ async def moderate_teacher_application(
                     row["class_id"],
                 )
                 await connection.execute(
+                    "DELETE FROM teacher_class_assignments WHERE teacher_max_user_id = $1",
+                    row["max_user_id"],
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO teacher_class_assignments (teacher_max_user_id, class_id)
+                    SELECT $1, class_id
+                    FROM teacher_application_classes
+                    WHERE application_id = $2
+                    UNION
+                    SELECT $1, $3
+                    ON CONFLICT DO NOTHING
+                    """,
+                    row["max_user_id"],
+                    application_id,
+                    row["class_id"],
+                )
+                await connection.execute(
                     """
                     UPDATE teacher_applications
                     SET status = 'approved', moderator_comment = $2, updated_at = NOW()
@@ -544,7 +653,21 @@ async def moderate_teacher_application(
                     row["invite_id"],
                     row["max_user_id"],
                 )
-                return True, "approved", int(row["max_user_id"]), row["class_name"]
+                assigned_names = await connection.fetchval(
+                    """
+                    SELECT string_agg(classes.name, ', ' ORDER BY classes.name)
+                    FROM teacher_class_assignments
+                    JOIN classes ON classes.id = teacher_class_assignments.class_id
+                    WHERE teacher_class_assignments.teacher_max_user_id = $1
+                    """,
+                    row["max_user_id"],
+                )
+                return (
+                    True,
+                    "approved",
+                    int(row["max_user_id"]),
+                    assigned_names or row["class_name"],
+                )
 
             await connection.execute(
                 """
@@ -647,7 +770,9 @@ async def list_classes_for_removal() -> list[tuple[str, str]]:
         await connection.close()
 
 
-async def get_class_usage(class_name: str) -> tuple[int, int, int, int, int, int, int, int] | None:
+async def get_class_usage(
+    class_name: str,
+) -> tuple[int, int, int, int, int, int, int, int, int, int] | None:
     connection = await asyncpg.connect(get_database_url())
     try:
         row = await connection.fetchrow(
@@ -659,7 +784,15 @@ async def get_class_usage(class_name: str) -> tuple[int, int, int, int, int, int
                    (SELECT COUNT(*) FROM event_signups WHERE event_signups.class_id = classes.id) AS signups_count,
                    (SELECT COUNT(*) FROM reports WHERE reports.class_id = classes.id) AS reports_count,
                    (SELECT COUNT(*) FROM ideas WHERE ideas.author_class_id = classes.id) AS ideas_count,
-                   (SELECT COUNT(*) FROM points_log WHERE points_log.class_id = classes.id) AS points_count
+                   (SELECT COUNT(*) FROM points_log WHERE points_log.class_id = classes.id) AS points_count,
+                   (SELECT COUNT(*) FROM teacher_class_assignments
+                    WHERE teacher_class_assignments.class_id = classes.id)
+                   + (SELECT COUNT(*) FROM teacher_application_classes
+                      WHERE teacher_application_classes.class_id = classes.id)
+                       AS teacher_links_count,
+                   (SELECT COUNT(*) FROM discipline_penalties
+                    WHERE discipline_penalties.class_id = classes.id)
+                       AS penalties_count
             FROM classes
             WHERE classes.name = $1 AND classes.archived = FALSE
             """,
@@ -678,6 +811,8 @@ async def get_class_usage(class_name: str) -> tuple[int, int, int, int, int, int
                 "reports_count",
                 "ideas_count",
                 "points_count",
+                "teacher_links_count",
+                "penalties_count",
             )
         )  # type: ignore[return-value]
     finally:
@@ -708,7 +843,15 @@ async def delete_class_if_empty(class_name: str) -> bool:
                     (SELECT COUNT(*) FROM event_signups WHERE event_signups.class_id = $1) AS signups_count,
                     (SELECT COUNT(*) FROM reports WHERE reports.class_id = $1) AS reports_count,
                     (SELECT COUNT(*) FROM ideas WHERE ideas.author_class_id = $1) AS ideas_count,
-                    (SELECT COUNT(*) FROM points_log WHERE points_log.class_id = $1) AS points_count
+                    (SELECT COUNT(*) FROM points_log WHERE points_log.class_id = $1) AS points_count,
+                    (SELECT COUNT(*) FROM teacher_class_assignments
+                     WHERE teacher_class_assignments.class_id = $1)
+                    + (SELECT COUNT(*) FROM teacher_application_classes
+                       WHERE teacher_application_classes.class_id = $1)
+                        AS teacher_links_count,
+                    (SELECT COUNT(*) FROM discipline_penalties
+                     WHERE discipline_penalties.class_id = $1)
+                        AS penalties_count
                 """,
                 row["id"],
             )
@@ -1922,6 +2065,321 @@ async def award_prize(class_name: str, place: int, confirmer_id: int) -> tuple[b
             )
             await refresh_period_winners(connection, month_start(moscow_today()))
             return True, points
+    finally:
+        await connection.close()
+
+
+MONTHLY_BONUS_LIMITS = {
+    "punctuality": 15,
+    "attendance": 15,
+    "discipline": 25,
+    "tidiness": 15,
+}
+
+MONTHLY_BONUS_LABELS = {
+    "punctuality": "Пунктуальность",
+    "attendance": "Посещаемость",
+    "discipline": "Дисциплина",
+    "tidiness": "Опрятность и форма",
+}
+
+
+async def get_monthly_bonus_status(
+    class_name: str,
+    category: str,
+) -> tuple[str, int, int, int]:
+    """Returns status, monthly penalty count, effective cap, current bonus."""
+    if category not in MONTHLY_BONUS_LIMITS:
+        return "invalid_category", 0, 0, 0
+
+    current_month = month_start(moscow_today())
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        class_row = await connection.fetchrow(
+            "SELECT id FROM classes WHERE name = $1 AND archived = FALSE",
+            class_name,
+        )
+        if class_row is None:
+            return "class_not_found", 0, 0, 0
+
+        period_open = await connection.fetchval(
+            "SELECT status = 'open' FROM rating_periods WHERE period_month = $1",
+            current_month,
+        )
+        if not period_open or not is_school_month(current_month):
+            return "period_not_open", 0, 0, 0
+
+        penalty_count = 0
+        if category == "discipline":
+            penalty_count = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM discipline_penalties
+                WHERE class_id = $1 AND period_month = $2
+                """,
+                class_row["id"],
+                current_month,
+            )
+        current_points = await connection.fetchval(
+            """
+            SELECT points
+            FROM monthly_class_bonuses
+            WHERE class_id = $1 AND period_month = $2 AND category = $3
+            """,
+            class_row["id"],
+            current_month,
+            category,
+        )
+        cap = MONTHLY_BONUS_LIMITS[category]
+        if category == "discipline":
+            cap = max(0, cap - int(penalty_count))
+        return "ok", int(penalty_count), cap, int(current_points or 0)
+    finally:
+        await connection.close()
+
+
+async def award_monthly_bonus(
+    admin_max_user_id: int,
+    class_name: str,
+    category: str,
+    points: int,
+) -> tuple[str, int, int]:
+    """Set a class's monthly bonus; updating it adjusts all ratings by delta."""
+    if category not in MONTHLY_BONUS_LIMITS:
+        return "invalid_category", 0, 0
+    if points < 0:
+        return "invalid_points", 0, 0
+    if (
+        admin_max_user_id not in get_admin_ids()
+        and await get_user_role(admin_max_user_id) != "admin"
+    ):
+        return "not_admin", 0, 0
+
+    current_month = month_start(moscow_today())
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            await lock_ratings(connection)
+            class_row = await connection.fetchrow(
+                """
+                SELECT id FROM classes
+                WHERE name = $1 AND archived = FALSE
+                FOR UPDATE
+                """,
+                class_name,
+            )
+            if class_row is None:
+                return "class_not_found", 0, 0
+            period_open = await connection.fetchval(
+                "SELECT status = 'open' FROM rating_periods WHERE period_month = $1",
+                current_month,
+            )
+            if not period_open or not is_school_month(current_month):
+                return "period_not_open", 0, 0
+
+            penalty_count = 0
+            if category == "discipline":
+                penalty_count = await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM discipline_penalties
+                    WHERE class_id = $1 AND period_month = $2
+                    """,
+                    class_row["id"],
+                    current_month,
+                )
+            cap = MONTHLY_BONUS_LIMITS[category]
+            if category == "discipline":
+                cap = max(0, cap - int(penalty_count))
+            if points > cap:
+                return "exceeds_limit", int(penalty_count), cap
+
+            existing = await connection.fetchrow(
+                """
+                SELECT monthly_class_bonuses.points,
+                       monthly_class_bonuses.points_log_id
+                FROM monthly_class_bonuses
+                WHERE class_id = $1 AND period_month = $2 AND category = $3
+                FOR UPDATE
+                """,
+                class_row["id"],
+                current_month,
+                category,
+            )
+            previous_points = int(existing["points"]) if existing else 0
+            delta = points - previous_points
+            label = MONTHLY_BONUS_LABELS[category]
+            reason = f"Ежемесячный бонус: {label}"
+            if existing is None:
+                points_log_id = await connection.fetchval(
+                    """
+                    INSERT INTO points_log (class_id, reason, points, period_month, confirmed_by)
+                    VALUES ($1, $2, $3, $4, (
+                        SELECT id FROM users WHERE max_user_id = $5
+                    ))
+                    RETURNING id
+                    """,
+                    class_row["id"],
+                    reason,
+                    points,
+                    current_month,
+                    admin_max_user_id,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO monthly_class_bonuses (
+                        class_id, period_month, category, points,
+                        points_log_id, updated_by_max_user_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    class_row["id"],
+                    current_month,
+                    category,
+                    points,
+                    points_log_id,
+                    admin_max_user_id,
+                )
+            else:
+                points_log_id = existing["points_log_id"]
+                await connection.execute(
+                    """
+                    UPDATE points_log
+                    SET points = $2, reason = $3,
+                        confirmed_by = (SELECT id FROM users WHERE max_user_id = $4)
+                    WHERE id = $1
+                    """,
+                    points_log_id,
+                    points,
+                    reason,
+                    admin_max_user_id,
+                )
+                await connection.execute(
+                    """
+                    UPDATE monthly_class_bonuses
+                    SET points = $2, updated_by_max_user_id = $3, updated_at = NOW()
+                    WHERE class_id = $1 AND period_month = $4 AND category = $5
+                    """,
+                    class_row["id"],
+                    points,
+                    admin_max_user_id,
+                    current_month,
+                    category,
+                )
+
+            if delta:
+                await connection.execute(
+                    "UPDATE classes SET points = points + $2 WHERE id = $1",
+                    class_row["id"],
+                    delta,
+                )
+            await refresh_period_winners(connection, current_month)
+            return "ok", int(penalty_count), cap
+    finally:
+        await connection.close()
+
+
+async def add_discipline_penalty(
+    teacher_max_user_id: int,
+    class_name: str,
+    note: str | None = None,
+) -> tuple[str, int, int, int]:
+    """Record a teacher remark and enforce the reduced discipline bonus cap."""
+    current_month = month_start(moscow_today())
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            await lock_ratings(connection)
+            role = await connection.fetchval(
+                "SELECT role FROM users WHERE max_user_id = $1",
+                teacher_max_user_id,
+            )
+            if role != "teacher":
+                return "not_teacher", 0, 0, 0
+
+            class_row = await connection.fetchrow(
+                """
+                SELECT classes.id
+                FROM classes
+                JOIN teacher_class_assignments assigned ON assigned.class_id = classes.id
+                WHERE assigned.teacher_max_user_id = $1
+                  AND classes.name = $2 AND classes.archived = FALSE
+                FOR UPDATE OF classes
+                """,
+                teacher_max_user_id,
+                class_name,
+            )
+            if class_row is None:
+                return "class_not_assigned", 0, 0, 0
+
+            period_open = await connection.fetchval(
+                "SELECT status = 'open' FROM rating_periods WHERE period_month = $1",
+                current_month,
+            )
+            if not period_open or not is_school_month(current_month):
+                return "period_not_open", 0, 0, 0
+
+            await connection.execute(
+                """
+                INSERT INTO discipline_penalties (
+                    class_id, period_month, teacher_max_user_id, note
+                ) VALUES ($1, $2, $3, $4)
+                """,
+                class_row["id"],
+                current_month,
+                teacher_max_user_id,
+                note,
+            )
+            penalty_count = int(await connection.fetchval(
+                """
+                SELECT COUNT(*) FROM discipline_penalties
+                WHERE class_id = $1 AND period_month = $2
+                """,
+                class_row["id"],
+                current_month,
+            ))
+            cap = max(0, MONTHLY_BONUS_LIMITS["discipline"] - penalty_count)
+            bonus = await connection.fetchrow(
+                """
+                SELECT points, points_log_id
+                FROM monthly_class_bonuses
+                WHERE class_id = $1 AND period_month = $2 AND category = 'discipline'
+                FOR UPDATE
+                """,
+                class_row["id"],
+                current_month,
+            )
+            deducted = 0
+            if bonus is not None and int(bonus["points"]) > cap:
+                previous_points = int(bonus["points"])
+                deducted = previous_points - cap
+                await connection.execute(
+                    """
+                    UPDATE monthly_class_bonuses
+                    SET points = $2, updated_by_max_user_id = $3, updated_at = NOW()
+                    WHERE class_id = $1 AND period_month = $4 AND category = 'discipline'
+                    """,
+                    class_row["id"],
+                    cap,
+                    teacher_max_user_id,
+                    current_month,
+                )
+                await connection.execute(
+                    """
+                    UPDATE points_log
+                    SET points = $2,
+                        reason = 'Ежемесячный бонус: Дисциплина (пересчёт после замечаний)'
+                    WHERE id = $1
+                    """,
+                    bonus["points_log_id"],
+                    cap,
+                )
+                await connection.execute(
+                    "UPDATE classes SET points = points - $2 WHERE id = $1",
+                    class_row["id"],
+                    deducted,
+                )
+            await refresh_period_winners(connection, current_month)
+            return "ok", penalty_count, cap, deducted
     finally:
         await connection.close()
 

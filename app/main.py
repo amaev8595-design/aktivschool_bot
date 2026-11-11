@@ -8,6 +8,8 @@ from datetime import date
 from fastapi import FastAPI
 
 from db import (
+    add_discipline_penalty,
+    award_monthly_bonus,
     award_prize,
     archive_class,
     bind_user_to_class,
@@ -31,6 +33,7 @@ from db import (
     get_class_usage,
     get_user_role,
     get_user_class,
+    get_monthly_bonus_status,
     get_current_month_value,
     get_month_rating,
     get_report_submitter_id,
@@ -46,6 +49,7 @@ from db import (
     list_rating_history,
     list_signed_up_events,
     list_teacher_invites,
+    list_teacher_assigned_classes,
     list_user_ids_by_roles,
     list_users_with_details,
     moderate_idea,
@@ -93,6 +97,7 @@ pending_event_selection_users: set[int] = set()
 pending_report_selection_users: set[int] = set()
 pending_user_reports: dict[int, dict[str, str]] = {}
 pending_teacher_forms: dict[int, dict[str, str]] = {}
+pending_teacher_penalties: dict[int, dict[str, str]] = {}
 pending_rating_context: dict[int, dict[str, str]] = {}
 BOT_MODE = os.getenv("BOT_MODE", "polling").strip().lower()
 
@@ -125,7 +130,7 @@ async def notify_moderators(text: str) -> None:
     await asyncio.gather(*(notify_user(user_id, text) for user_id in user_ids))
 
 
-def main_keyboard(is_admin: bool = False):
+def main_keyboard(is_admin: bool = False, is_teacher: bool = False):
     keyboard = (
         KeyboardBuilder()
         .add_message(text="🎯 Ценность месяца")
@@ -139,6 +144,9 @@ def main_keyboard(is_admin: bool = False):
     )
     if is_admin:
         keyboard.add_message(text="⚙️ Администрирование")
+        return keyboard.adjust(2, 2, 2, 2, 1).build()
+    if is_teacher:
+        keyboard.add_message(text="⚠️ Штрафы классу")
         return keyboard.adjust(2, 2, 2, 2, 1).build()
     return keyboard.adjust(2, 2, 2, 1).build()
 
@@ -174,10 +182,11 @@ def admin_keyboard():
         .add_message(text="✅ Одобрить отчёт")
         .add_message(text="❌ Отклонить отчёт")
         .add_message(text="🏅 Призовые баллы")
+        .add_message(text="🎁 Дополнительные баллы")
         .add_message(text="⚙️ Лимиты")
         .add_message(text="↩️ Главное меню")
     )
-    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2).build()
+    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1).build()
 
 
 def class_group_keyboard():
@@ -210,6 +219,31 @@ def options_keyboard(*labels: str):
     for label in labels:
         keyboard.add_message(text=label)
     return keyboard.adjust(1).build()
+
+
+BONUS_CATEGORY_BUTTONS = {
+    "📍 Пунктуальность": ("punctuality", "Пунктуальность", 15),
+    "📘 Посещаемость": ("attendance", "Посещаемость", 15),
+    "🧭 Дисциплина": ("discipline", "Дисциплина", 25),
+    "👔 Опрятность и форма": ("tidiness", "Опрятность и форма", 15),
+}
+
+
+def teacher_class_selection_keyboard(
+    classes: list[tuple[str, str]], selected: set[str],
+):
+    labels = [
+        f"{'✅' if name in selected else '⬜'} {name} · {rating_label(age_group)}"
+        for name, age_group in classes
+    ]
+    return options_keyboard(*labels, "✅ Готово", "↩️ Отмена")
+
+
+def class_button_names(classes: list[tuple[str, str]]) -> dict[str, str]:
+    return {
+        f"{name} · {rating_label(age_group)}": name
+        for name, age_group in classes
+    }
 
 
 async def answer_lines(message, lines: list[str], keyboard) -> None:
@@ -265,6 +299,7 @@ def context_keyboard(context: str):
             "↩️ Администрирование",
         ),
         "award": options_keyboard("🏅 Призовые баллы", "↩️ Администрирование"),
+        "bonus": options_keyboard("🎁 Дополнительные баллы", "↩️ Администрирование"),
         "limit": options_keyboard("⚙️ Лимиты", "↩️ Администрирование"),
     }
     return keyboards[context]
@@ -505,7 +540,7 @@ async def send_users_by_role(message: MessageCreated, role: str) -> None:
                 teacher_details += f" — {subject}"
             lines.append(f"• {teacher_details}\n  ID: {max_user_id}")
             if class_name:
-                lines.append(f"  Класс: {class_name}")
+                lines.append(f"  Классы: {class_name}")
             continue
         class_text = f" — класс: {class_name}" if class_name else ""
         lines.append(f"• {max_user_id}{class_text}")
@@ -585,8 +620,14 @@ async def can_change_admin_role(target_id: int, new_role: str) -> bool:
 async def entry_keyboard(user_id: int | None):
     is_admin = await is_admin_user(user_id)
     user_class = await get_user_class(user_id) if user_id is not None else None
-    if is_admin or user_class is not None:
-        return main_keyboard(is_admin)
+    role = await get_user_role(user_id) if user_id is not None else None
+    teacher_classes = (
+        await list_teacher_assigned_classes(user_id)
+        if user_id is not None and role == "teacher"
+        else []
+    )
+    if is_admin or user_class is not None or teacher_classes:
+        return main_keyboard(is_admin, is_teacher=role == "teacher")
     return registration_keyboard()
 
 
@@ -630,7 +671,23 @@ async def start_screen(user_id: int) -> tuple[str, object]:
         )
 
     user_class = await get_user_class(user_id)
+    role = await get_user_role(user_id)
+    teacher_classes = (
+        await list_teacher_assigned_classes(user_id)
+        if role == "teacher"
+        else []
+    )
     if user_class is None:
+        if teacher_classes:
+            class_names = ", ".join(
+                f"{name} ({rating_label(age_group)})"
+                for name, age_group in teacher_classes
+            )
+            return (
+                f"Привет! Вы зарегистрированы как учитель. Ваши классы: {class_names}.\n"
+                "Выберите раздел меню:",
+                main_keyboard(is_teacher=True),
+            )
         application = await get_teacher_application(user_id)
         if application is not None and application[1] == "pending":
             return (
@@ -651,8 +708,18 @@ async def start_screen(user_id: int) -> tuple[str, object]:
             registration_keyboard(),
         )
 
+    if role == "teacher":
+        class_names = ", ".join(
+            f"{name} ({rating_label(age_group)})"
+            for name, age_group in teacher_classes
+        ) or f"{user_class[0]} ({rating_label(user_class[1])})"
+        return (
+            f"Привет! Вы зарегистрированы как учитель. Ваши классы: {class_names}.\n"
+            "Выберите раздел меню:",
+            main_keyboard(is_teacher=True),
+        )
     return (
-        f"Привет! Вы привязаны к классу {user_class[0]} ({user_class[1]}).\n"
+        f"Привет! Вы привязаны к классу {user_class[0]} ({rating_label(user_class[1])}).\n"
         "Выберите раздел меню:",
         main_keyboard(),
     )
@@ -693,6 +760,7 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_report_selection_users.discard(message.user_id)
         pending_user_reports.pop(message.user_id, None)
         pending_teacher_forms.pop(message.user_id, None)
+        pending_teacher_penalties.pop(message.user_id, None)
         pending_rating_context.pop(message.user_id, None)
         await message.answer(
             "Текущий сценарий отменён.",
@@ -701,18 +769,18 @@ async def echo_handler(message: MessageCreated) -> None:
         return
 
     if text == "ℹ️ Инструкция":
-        is_admin = await is_admin_user(message.user_id)
-        user_class = await get_user_class(message.user_id) if message.user_id is not None else None
         await message.answer(
             "ℹ️ Краткая инструкция\n\n"
             "👨‍🎓 Ученик: выберите регистрацию ученика и введите код класса.\n"
             "👩‍🏫 Учитель: заполните заявку и используйте персональный код, "
-            "выданный администратором.\n"
+            "выданный администратором. В заявке отметьте все классы, где преподаёте. "
+            "Кнопка «⚠️ Штрафы классу» позволяет зафиксировать замечание для одного "
+            "из классов, закреплённых за учителем.\n"
             "🎪 Афиша — запись класса на мероприятия.\n"
             "📋 Подать отчёт — отправка одного отчёта от класса за мероприятие.\n"
             "💡 Подать идею — предложить новое мероприятие.\n\n"
             "Для возврата используйте кнопку «▶️ Старт».",
-            keyboard=main_keyboard(is_admin) if is_admin or user_class is not None else registration_keyboard(),
+            keyboard=await entry_keyboard(message.user_id),
         )
         return
 
@@ -726,6 +794,7 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_report_selection_users.discard(message.user_id)
         pending_user_reports.pop(message.user_id, None)
         pending_teacher_forms.pop(message.user_id, None)
+        pending_teacher_penalties.pop(message.user_id, None)
         pending_rating_context.pop(message.user_id, None)
         await start_handler(message)
         return
@@ -902,13 +971,62 @@ async def echo_handler(message: MessageCreated) -> None:
                 return
             form["invite_code"] = value.upper()
             form["class_name"] = invite[2]
-            form["step"] = "confirm"
+            form["selected_classes"] = invite[2]
+            form["step"] = "classes"
+            classes = await list_classes_for_removal()
             await message.answer(
-                f"ФИО: {form['full_name']}\n"
-                f"Предмет: {form['subject']}\n"
-                f"Класс: {form['class_name']}\n\n"
-                "Отправить заявку администратору?",
-                keyboard=confirmation_keyboard("✅ Отправить заявку"),
+                f"Код подтверждён для класса {form['class_name']} — он уже выбран.\n"
+                "Отметьте остальные классы, где вы преподаёте, затем нажмите «✅ Готово».\n"
+                "Список будет передан администратору вместе с заявкой.",
+                keyboard=teacher_class_selection_keyboard(classes, {form["class_name"]}),
+            )
+            return
+
+        if form["step"] == "classes":
+            classes = await list_classes_for_removal()
+            choices = class_button_names(classes)
+            selected = set(filter(None, form.get("selected_classes", "").split("\n")))
+            if value == "✅ Готово":
+                if not selected:
+                    await message.answer(
+                        "Выберите хотя бы один класс.",
+                        keyboard=teacher_class_selection_keyboard(classes, selected),
+                    )
+                    return
+                form["selected_classes"] = "\n".join(sorted(selected))
+                form["step"] = "confirm"
+                class_names = ", ".join(sorted(selected))
+                await message.answer(
+                    f"ФИО: {form['full_name']}\n"
+                    f"Предмет: {form['subject']}\n"
+                    f"Классы: {class_names}\n\n"
+                    "Отправить заявку администратору?",
+                    keyboard=confirmation_keyboard("✅ Отправить заявку"),
+                )
+                return
+
+            button_name = value[2:] if value.startswith(("✅ ", "⬜ ")) else ""
+            class_name = choices.get(button_name)
+            if class_name is None:
+                await message.answer(
+                    "Отметьте классы кнопками и нажмите «✅ Готово».",
+                    keyboard=teacher_class_selection_keyboard(classes, selected),
+                )
+                return
+            if class_name == form["class_name"]:
+                await message.answer(
+                    "Класс, подтверждённый персональным кодом, уже включён в заявку.",
+                    keyboard=teacher_class_selection_keyboard(classes, selected),
+                )
+                return
+            if class_name in selected:
+                selected.remove(class_name)
+            else:
+                selected.add(class_name)
+            form["selected_classes"] = "\n".join(sorted(selected))
+            await message.answer(
+                "Выберите все классы, где вы преподаёте, и нажмите «✅ Готово».",
+                keyboard=teacher_class_selection_keyboard(classes, selected),
             )
             return
 
@@ -928,6 +1046,7 @@ async def echo_handler(message: MessageCreated) -> None:
                 form["full_name"],
                 form["subject"],
                 form["invite_code"],
+                list(filter(None, form.get("selected_classes", "").split("\n"))),
             )
             pending_teacher_forms.pop(message.user_id, None)
             if result == "already_pending":
@@ -939,12 +1058,18 @@ async def echo_handler(message: MessageCreated) -> None:
             if result == "already_approved":
                 await message.answer(
                     "Ваша заявка уже одобрена.",
-                    keyboard=main_keyboard(await is_admin_user(message.user_id)),
+                    keyboard=await entry_keyboard(message.user_id),
                 )
                 return
             if result == "invite_in_use":
                 await message.answer(
                     "Этот код уже используется в другой заявке. Получите новый код у администратора.",
+                    keyboard=registration_keyboard(),
+                )
+                return
+            if result == "invalid_classes":
+                await message.answer(
+                    "Список классов изменился. Начните регистрацию заново и выберите активные классы.",
                     keyboard=registration_keyboard(),
                 )
                 return
@@ -958,7 +1083,7 @@ async def echo_handler(message: MessageCreated) -> None:
                 f"👩‍🏫 Новая заявка учителя №{application_id}.\n"
                 f"ФИО: {form['full_name']}\n"
                 f"Предмет: {form['subject']}\n"
-                f"Класс: {class_name}\n"
+                f"Классы: {', '.join(filter(None, form.get('selected_classes', '').split(chr(10))))}\n"
                 "Откройте раздел «👩‍🏫 Заявки учителей»."
             )
             await message.answer(
@@ -966,6 +1091,151 @@ async def echo_handler(message: MessageCreated) -> None:
                 keyboard=registration_keyboard(),
             )
             return
+
+    if message.user_id in pending_teacher_penalties:
+        form = pending_teacher_penalties[message.user_id]
+        value = text.strip()
+
+        if form["step"] == "class":
+            classes = await list_teacher_assigned_classes(message.user_id)
+            class_names = class_button_names(classes)
+            class_name = class_names.get(value)
+            if class_name is None:
+                await message.answer(
+                    "Выберите класс из списка закреплённых за вами.",
+                    keyboard=options_keyboard(*class_names.keys(), "↩️ Отмена"),
+                )
+                return
+            status, penalty_count, cap, current_points = await get_monthly_bonus_status(
+                class_name, "discipline"
+            )
+            if status == "period_not_open":
+                pending_teacher_penalties.pop(message.user_id, None)
+                await message.answer(
+                    "Пока нельзя добавить замечание: администратор ещё не открыл "
+                    "текущий месяц, введя его ценность.",
+                    keyboard=await entry_keyboard(message.user_id),
+                )
+                return
+            if status != "ok":
+                pending_teacher_penalties.pop(message.user_id, None)
+                await message.answer(
+                    "Не удалось проверить выбранный класс. Попробуйте позже.",
+                    keyboard=await entry_keyboard(message.user_id),
+                )
+                return
+            form.update(
+                {
+                    "class": class_name,
+                    "step": "note",
+                    "penalty_count": str(penalty_count),
+                    "cap": str(cap),
+                    "current_points": str(current_points),
+                }
+            )
+            await message.answer(
+                f"Класс {class_name}: сейчас {penalty_count} замечаний за месяц; "
+                f"максимум за дисциплину — {cap}/25 баллов.\n"
+                "Введите короткий комментарий или нажмите «⏭ Без комментария».",
+                keyboard=options_keyboard("⏭ Без комментария", "↩️ Отмена"),
+            )
+            return
+
+        if form["step"] == "note":
+            if value == "⏭ Без комментария":
+                form["note"] = ""
+            elif len(value) > 300:
+                await message.answer(
+                    "Комментарий должен быть не длиннее 300 символов.",
+                    keyboard=options_keyboard("⏭ Без комментария", "↩️ Отмена"),
+                )
+                return
+            else:
+                form["note"] = value
+            form["step"] = "confirm"
+            await message.answer(
+                f"Зафиксировать замечание классу {form['class']} за дисциплину?\n"
+                f"Комментарий: {form['note'] or 'не указан'}",
+                keyboard=confirmation_keyboard("⚠️ Подтвердить замечание"),
+            )
+            return
+
+        if form["step"] == "confirm":
+            if value == "✏️ Изменить":
+                form["step"] = "class"
+                classes = await list_teacher_assigned_classes(message.user_id)
+                class_names = class_button_names(classes)
+                await message.answer(
+                    "Выберите класс заново:",
+                    keyboard=options_keyboard(*class_names.keys(), "↩️ Отмена"),
+                )
+                return
+            if value != "⚠️ Подтвердить замечание":
+                await message.answer(
+                    "Нажмите «⚠️ Подтвердить замечание» или «✏️ Изменить»."
+                )
+                return
+
+            result, penalty_count, cap, deducted = await add_discipline_penalty(
+                message.user_id,
+                form["class"],
+                form.get("note") or None,
+            )
+            pending_teacher_penalties.pop(message.user_id, None)
+            if result == "period_not_open":
+                await message.answer(
+                    "Замечание не сохранено: администратор ещё не открыл текущий месяц.",
+                    keyboard=await entry_keyboard(message.user_id),
+                )
+                return
+            if result in {"not_teacher", "class_not_assigned"}:
+                await message.answer(
+                    "Не удалось сохранить замечание: роль учителя или закрепление класса "
+                    "изменились. Обратитесь к администратору.",
+                    keyboard=await entry_keyboard(message.user_id),
+                )
+                return
+            if result != "ok":
+                await message.answer(
+                    "Не удалось сохранить замечание. Обратитесь к администратору.",
+                    keyboard=await entry_keyboard(message.user_id),
+                )
+                return
+            deducted_text = (
+                f"\nС уже начисленного бонуса снято {deducted} баллов."
+                if deducted
+                else ""
+            )
+            await message.answer(
+                f"Замечание классу {form['class']} сохранено. Замечаний за месяц: "
+                f"{penalty_count}. Максимум за дисциплину теперь {cap}/25 баллов."
+                f"{deducted_text}",
+                keyboard=await entry_keyboard(message.user_id),
+            )
+            await notify_moderators(
+                f"⚠️ Учитель MAX ID {message.user_id} зафиксировал замечание классу "
+                f"{form['class']} за дисциплину. Замечаний за месяц: {penalty_count}; "
+                f"максимум бонуса: {cap}/25."
+                + (f"\nКомментарий: {form['note']}" if form.get("note") else "")
+            )
+            return
+
+    if text == "⚠️ Штрафы классу":
+        if message.user_id is None or await get_user_role(message.user_id) != "teacher":
+            await message.answer("Раздел доступен только пользователям с ролью учителя.")
+            return
+        classes = await list_teacher_assigned_classes(message.user_id)
+        if not classes:
+            await message.answer("За вами пока не закреплены классы. Обратитесь к администратору.")
+            return
+        pending_admin_forms.pop(message.user_id, None)
+        pending_teacher_penalties[message.user_id] = {"step": "class"}
+        class_names = class_button_names(classes)
+        await message.answer(
+            "Выберите свой класс, которому нужно зафиксировать замечание:",
+            keyboard=options_keyboard(*class_names.keys(), "↩️ Отмена"),
+        )
+        return
 
     if message.user_id in pending_admin_forms:
         form = pending_admin_forms[message.user_id]
@@ -1008,6 +1278,8 @@ async def echo_handler(message: MessageCreated) -> None:
                     ("отчётов", usage[5]),
                     ("идей", usage[6]),
                     ("начислений баллов", usage[7]),
+                    ("связей учителей и заявок", usage[8]),
+                    ("замечаний за дисциплину", usage[9]),
                 )
                 used_details = "\n".join(
                     f"• {label}: {count}"
@@ -1533,6 +1805,153 @@ async def echo_handler(message: MessageCreated) -> None:
                 )
                 return
 
+        elif kind == "bonus":
+            category_by_button = {
+                button: (key, label, limit)
+                for button, (key, label, limit) in BONUS_CATEGORY_BUTTONS.items()
+            }
+            if form["step"] == "class":
+                available_classes = await list_classes_for_removal()
+                class_names = class_button_names(available_classes)
+                selected_class = class_names.get(value)
+                if selected_class is None:
+                    await message.answer(
+                        "Выберите активный класс кнопкой.",
+                        keyboard=options_keyboard(*class_names.keys(), "↩️ Отмена"),
+                    )
+                    return
+                form["class"] = selected_class
+                form["step"] = "category"
+                await message.answer(
+                    f"Выбран класс {selected_class}. Выберите показатель для бонуса:",
+                    keyboard=options_keyboard(*BONUS_CATEGORY_BUTTONS.keys(), "↩️ Отмена"),
+                )
+                return
+
+            if form["step"] == "category":
+                selected = category_by_button.get(value)
+                if selected is None:
+                    await message.answer(
+                        "Выберите показатель кнопкой.",
+                        keyboard=options_keyboard(*BONUS_CATEGORY_BUTTONS.keys(), "↩️ Отмена"),
+                    )
+                    return
+                category, label, _base_limit = selected
+                status, penalty_count, cap, current_points = await get_monthly_bonus_status(
+                    form["class"], category
+                )
+                if status == "period_not_open":
+                    pending_admin_forms.pop(message.user_id, None)
+                    await message.answer(
+                        "Нельзя начислить бонус: текущий месяц ещё не открыт. "
+                        "Сначала задайте ценность месяца.",
+                        keyboard=context_keyboard("bonus"),
+                    )
+                    return
+                if status != "ok":
+                    pending_admin_forms.pop(message.user_id, None)
+                    await message.answer(
+                        "Не удалось проверить класс. Начните начисление заново.",
+                        keyboard=context_keyboard("bonus"),
+                    )
+                    return
+                form.update(
+                    {
+                        "category": category,
+                        "category_label": label,
+                        "cap": str(cap),
+                        "penalty_count": str(penalty_count),
+                        "current_points": str(current_points),
+                        "step": "points",
+                    }
+                )
+                penalty_hint = (
+                    f"Учителя зафиксировали {penalty_count} замечаний; "
+                    if category == "discipline"
+                    else ""
+                )
+                await message.answer(
+                    f"{label} для класса {form['class']}: {penalty_hint}"
+                    f"максимум {cap} баллов. Сейчас начислено {current_points}.\n"
+                    f"Введите итоговое количество баллов от 0 до {cap}. "
+                    "Новое значение заменит прежнее.",
+                    keyboard=cancel_keyboard(),
+                )
+                return
+
+            if form["step"] == "points":
+                cap = int(form["cap"])
+                if not value.isdigit() or not 0 <= int(value) <= cap:
+                    await message.answer(
+                        f"Введите целое число от 0 до {cap}, учитывая замечания учителей.",
+                        keyboard=cancel_keyboard(),
+                    )
+                    return
+                form["points"] = value
+                form["step"] = "confirm"
+                await message.answer(
+                    f"Установить бонус «{form['category_label']}» классу {form['class']} "
+                    f"за текущий месяц равным {value} баллам?\n"
+                    f"Ограничение: {form['cap']}; сейчас: {form['current_points']}."
+                    + (
+                        f" Замечаний учителей: {form['penalty_count']}."
+                        if form["category"] == "discipline"
+                        else ""
+                    ),
+                    keyboard=confirmation_keyboard("✅ Сохранить бонус"),
+                )
+                return
+
+            if form["step"] == "confirm":
+                if value == "✏️ Изменить":
+                    form["step"] = "points"
+                    await message.answer(
+                        f"Введите итоговое количество баллов от 0 до {form['cap']}.",
+                        keyboard=cancel_keyboard(),
+                    )
+                    return
+                if value != "✅ Сохранить бонус":
+                    await message.answer(
+                        "Нажмите «✅ Сохранить бонус» или «✏️ Изменить».",
+                        keyboard=confirmation_keyboard("✅ Сохранить бонус"),
+                    )
+                    return
+                status, penalty_count, cap = await award_monthly_bonus(
+                    message.user_id,
+                    form["class"],
+                    form["category"],
+                    int(form["points"]),
+                )
+                pending_admin_forms.pop(message.user_id, None)
+                if status == "exceeds_limit":
+                    await message.answer(
+                        f"Бонус не сохранён: с учётом {penalty_count} замечаний "
+                        f"максимум за дисциплину составляет {cap} баллов. "
+                        "Начните начисление заново.",
+                        keyboard=context_keyboard("bonus"),
+                    )
+                    return
+                if status == "period_not_open":
+                    await message.answer(
+                        "Бонус не сохранён: текущий месяц закрыт или ещё не открыт.",
+                        keyboard=context_keyboard("bonus"),
+                    )
+                    return
+                if status != "ok":
+                    await message.answer(
+                        "Не удалось сохранить бонус. Проверьте права администратора "
+                        "и выбранный класс.",
+                        keyboard=context_keyboard("bonus"),
+                    )
+                    return
+                await message.answer(
+                    f"Бонус «{form['category_label']}» класса {form['class']} "
+                    f"сохранён: {form['points']} баллов за текущий месяц. "
+                    "Месячный и годовой рейтинги пересчитаны.",
+                    keyboard=context_keyboard("bonus"),
+                )
+                return
+
         elif kind == "setlimit":
             limit_types = {"💡 Лимит идей": "ideas", "✅ Лимит одобрений": "approvals"}
             if form["step"] == "type":
@@ -1898,6 +2317,10 @@ async def echo_handler(message: MessageCreated) -> None:
             {"kind": "award", "step": "class"},
             "Введите название класса.",
         ),
+        "🎁 Дополнительные баллы": (
+            {"kind": "bonus", "step": "class"},
+            "Выберите класс для начисления дополнительных баллов:",
+        ),
         "⚙️ Лимиты": (
             {"kind": "setlimit", "step": "type"},
             "Выберите тип лимита:",
@@ -1941,6 +2364,17 @@ async def echo_handler(message: MessageCreated) -> None:
                 *(name for name, _age_group in classes),
                 "↩️ Отмена",
             )
+        elif text == "🎁 Дополнительные баллы":
+            classes = await list_classes_for_removal()
+            if not classes:
+                pending_admin_forms.pop(message.user_id, None)
+                await message.answer(
+                    "Активных классов для начисления бонусов нет.",
+                    keyboard=context_keyboard("bonus"),
+                )
+                return
+            class_names = class_button_names(classes)
+            keyboard = options_keyboard(*class_names.keys(), "↩️ Отмена")
         await message.answer(
             prompt + "\n\nДля отмены нажмите «↩️ Отмена».",
             keyboard=keyboard,
@@ -2023,7 +2457,7 @@ async def echo_handler(message: MessageCreated) -> None:
                 f"\nЗаявка №{application_id}\n"
                 f"ФИО: {full_name}\n"
                 f"Предмет: {subject}\n"
-                f"Класс: {class_name}\n"
+                f"Преподаёт в классах: {class_name}\n"
                 f"MAX ID: {max_user_id}"
             )
         await message.answer("\n".join(lines), keyboard=teacher_application_actions_keyboard())
@@ -2044,14 +2478,14 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer("Заявка не найдена или уже обработана.")
             return
         await message.answer(
-            f"Заявка одобрена. Учитель привязан к классу {class_name}.",
+            f"Заявка одобрена. Учитель привязан к классам: {class_name}.",
             keyboard=teacher_application_actions_keyboard(),
         )
         if applicant_id is not None:
             await notify_user(
                 applicant_id,
                 f"✅ Заявка на регистрацию учителя одобрена.\n"
-                f"Вы привязаны к классу {class_name}.",
+                f"Вы привязаны к классам: {class_name}.",
             )
         return
 
