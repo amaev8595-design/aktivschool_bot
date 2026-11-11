@@ -106,6 +106,11 @@ AGE_GROUP_LABELS = {
     "5-8": "5–8 классы",
     "9-11": "9–11 классы",
 }
+AGE_GROUP_BUTTONS = {
+    "1–4 классы": "1-4",
+    "5–8 классы": "5-8",
+    "9–11 классы": "9-11",
+}
 
 
 def media_tokens(message: MessageCreated) -> str | None:
@@ -1810,14 +1815,61 @@ async def echo_handler(message: MessageCreated) -> None:
                 button: (key, label, limit)
                 for button, (key, label, limit) in BONUS_CATEGORY_BUTTONS.items()
             }
+            if form["step"] == "group":
+                age_group = AGE_GROUP_BUTTONS.get(value)
+                if age_group is None:
+                    await message.answer(
+                        "Выберите возрастную группу кнопкой.",
+                        keyboard=options_keyboard(*AGE_GROUP_BUTTONS.keys(), "↩️ Отмена"),
+                    )
+                    return
+                form["age_group"] = age_group
+                form["step"] = "class"
+                available_classes = [
+                    name
+                    for name, group in await list_classes_for_removal()
+                    if group == age_group
+                ]
+                if not available_classes:
+                    form["step"] = "group"
+                    await message.answer(
+                        f"В группе «{AGE_GROUP_LABELS[age_group]}» пока нет активных классов. "
+                        "Выберите другую группу:",
+                        keyboard=options_keyboard(*AGE_GROUP_BUTTONS.keys(), "↩️ Отмена"),
+                    )
+                    return
+                await message.answer(
+                    f"Выберите класс из группы «{AGE_GROUP_LABELS[age_group]}»:",
+                    keyboard=options_keyboard(
+                        *available_classes,
+                        "↩️ К выбору группы",
+                        "↩️ Отмена",
+                    ),
+                )
+                return
+
             if form["step"] == "class":
-                available_classes = await list_classes_for_removal()
-                class_names = class_button_names(available_classes)
-                selected_class = class_names.get(value)
+                if value == "↩️ К выбору группы":
+                    form["step"] = "group"
+                    await message.answer(
+                        "Выберите возрастную группу:",
+                        keyboard=options_keyboard(*AGE_GROUP_BUTTONS.keys(), "↩️ Отмена"),
+                    )
+                    return
+                available_classes = {
+                    name
+                    for name, group in await list_classes_for_removal()
+                    if group == form["age_group"]
+                }
+                selected_class = value if value in available_classes else None
                 if selected_class is None:
                     await message.answer(
-                        "Выберите активный класс кнопкой.",
-                        keyboard=options_keyboard(*class_names.keys(), "↩️ Отмена"),
+                        "Выберите класс кнопкой из этой возрастной группы.",
+                        keyboard=options_keyboard(
+                            *sorted(available_classes),
+                            "↩️ К выбору группы",
+                            "↩️ Отмена",
+                        ),
                     )
                     return
                 form["class"] = selected_class
@@ -2318,8 +2370,8 @@ async def echo_handler(message: MessageCreated) -> None:
             "Введите название класса.",
         ),
         "🎁 Дополнительные баллы": (
-            {"kind": "bonus", "step": "class"},
-            "Выберите класс для начисления дополнительных баллов:",
+            {"kind": "bonus", "step": "group"},
+            "Выберите возрастную группу для начисления дополнительных баллов:",
         ),
         "⚙️ Лимиты": (
             {"kind": "setlimit", "step": "type"},
@@ -2373,8 +2425,7 @@ async def echo_handler(message: MessageCreated) -> None:
                     keyboard=context_keyboard("bonus"),
                 )
                 return
-            class_names = class_button_names(classes)
-            keyboard = options_keyboard(*class_names.keys(), "↩️ Отмена")
+            keyboard = options_keyboard(*AGE_GROUP_BUTTONS.keys(), "↩️ Отмена")
         await message.answer(
             prompt + "\n\nДля отмены нажмите «↩️ Отмена».",
             keyboard=keyboard,
