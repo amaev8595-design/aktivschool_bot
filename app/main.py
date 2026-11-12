@@ -226,7 +226,11 @@ def options_keyboard(*labels: str):
     keyboard = KeyboardBuilder()
     for label in labels:
         keyboard.add_message(text=label)
-    return keyboard.adjust(1).build()
+    # MAX allows at most 30 keyboard rows and 7 buttons per row. Keep short
+    # choice lists easy to read, and put longer lists into enough columns to
+    # stay within the row limit (for example, a whole-school class list).
+    columns = min(7, max(1, (len(labels) + 29) // 30))
+    return keyboard.adjust(columns).build()
 
 
 BONUS_CATEGORY_BUTTONS = {
