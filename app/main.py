@@ -29,6 +29,7 @@ from db import (
     get_teacher_application,
     get_teacher_invite,
     get_idea_author_id,
+    get_idea_for_revision,
     get_class_place,
     get_class_team,
     get_class_usage,
@@ -36,6 +37,9 @@ from db import (
     get_user_class,
     get_monthly_bonus_status,
     get_current_month_value,
+    get_monthly_value,
+    list_monthly_values,
+    correct_monthly_value,
     get_admin_month_dashboard,
     get_deadline_reminder_info,
     get_class_rating_breakdown,
@@ -49,6 +53,7 @@ from db import (
     list_pending_reports,
     list_pending_teacher_applications,
     list_pending_ideas,
+    list_ideas_for_revision,
     list_academic_year_rating,
     list_current_month_rating,
     list_recent_rating_actions,
@@ -64,6 +69,7 @@ from db import (
     revise_report,
     set_user_role,
     set_monthly_value,
+    update_idea_after_revision,
     set_setting,
     mark_deadline_reminder_sent,
     rollover_school_year,
@@ -133,9 +139,16 @@ def media_tokens(message: MessageCreated) -> str | None:
     return ",".join(tokens) if tokens else None
 
 
-async def notify_user(user_id: int, text: str) -> bool:
+async def notify_user(user_id: int, text: str, keyboard=None) -> bool:
     try:
-        await bot.send_message(user_id=user_id, text=text)
+        if keyboard is None:
+            await bot.send_message(user_id=user_id, text=text)
+        else:
+            await bot.send_message(
+                user_id=user_id,
+                text=text,
+                attachments=[InlineKeyboardAttachmentRequest.factory(keyboard)],
+            )
         return True
     except Exception as error:  # noqa: BLE001 - уведомление не должно останавливать бота
         print(f"Не удалось отправить уведомление пользователю {user_id}: {error}")
@@ -155,6 +168,7 @@ def main_keyboard(is_admin: bool = False, is_teacher: bool = False):
         .add_message(text="🏆 Рейтинг")
         .add_message(text="🎪 Афиша")
         .add_message(text="💡 Подать идею")
+        .add_message(text="✏️ Исправить идею")
         .add_message(text="📍 Место")
         .add_message(text="👥 Команда")
         .add_message(text="ℹ️ Инструкция")
@@ -162,11 +176,11 @@ def main_keyboard(is_admin: bool = False, is_teacher: bool = False):
     )
     if is_admin:
         keyboard.add_message(text="⚙️ Администрирование")
-        return keyboard.adjust(2, 2, 2, 2, 1).build()
+        return keyboard.adjust(2, 2, 2, 2, 2, 1).build()
     if is_teacher:
         keyboard.add_message(text="⚠️ Штрафы классу")
-        return keyboard.adjust(2, 2, 2, 2, 1).build()
-    return keyboard.adjust(2, 2, 2, 1).build()
+        return keyboard.adjust(2, 2, 2, 2, 2, 1).build()
+    return keyboard.adjust(2, 2, 2, 2, 1).build()
 
 
 def registration_keyboard():
@@ -182,6 +196,7 @@ def admin_keyboard():
     keyboard = (
         KeyboardBuilder()
         .add_message(text="⚙️ Ценность месяца")
+        .add_message(text="📝 Исправить ценность")
         .add_message(text="➕ Добавить класс")
         .add_message(text="🗑 Удалить класс")
         .add_message(text="📅 Добавить мероприятие")
@@ -194,6 +209,7 @@ def admin_keyboard():
         .add_message(text="👩‍🏫 Заявки учителей")
         .add_message(text="🔑 Коды учителей")
         .add_message(text="✅ Одобрить идею")
+        .add_message(text="✏️ Вернуть идею на доработку")
         .add_message(text="❌ Отклонить идею")
         .add_message(text="✅ Одобрить заявку")
         .add_message(text="❌ Отклонить заявку")
@@ -207,7 +223,7 @@ def admin_keyboard():
         .add_message(text="🔄 Новый учебный год")
         .add_message(text="↩️ Главное меню")
     )
-    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1).build()
+    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1).build()
 
 
 def class_group_keyboard():
@@ -233,6 +249,10 @@ def class_confirmation_keyboard():
 
 def cancel_keyboard():
     return KeyboardBuilder().add_message(text="↩️ Отмена").adjust(1).build()
+
+
+def idea_revision_keyboard():
+    return options_keyboard("⏭️ Оставить без изменений", "↩️ Отмена")
 
 
 def options_keyboard(*labels: str):
@@ -302,7 +322,9 @@ def report_confirmation_keyboard(confirm_label: str):
 
 def context_keyboard(context: str):
     keyboards = {
-        "value": options_keyboard("⚙️ Ценность месяца", "↩️ Администрирование"),
+        "value": options_keyboard(
+            "⚙️ Ценность месяца", "📝 Исправить ценность", "↩️ Администрирование"
+        ),
         "class": options_keyboard(
             "➕ Добавить класс",
             "🗑 Удалить класс",
@@ -315,7 +337,11 @@ def context_keyboard(context: str):
         "role": options_keyboard(
             "🛡 Назначить роль", "👥 Пользователи", "↩️ Администрирование"
         ),
-        "idea": options_keyboard("✅ Одобрить идею", "❌ Отклонить идею"),
+        "idea": options_keyboard(
+            "✅ Одобрить идею",
+            "✏️ Вернуть идею на доработку",
+            "❌ Отклонить идею",
+        ),
         "report": report_actions_keyboard(),
         "teacher": teacher_application_actions_keyboard(),
         "teacher_codes": options_keyboard(
@@ -1250,39 +1276,120 @@ async def echo_handler(message: MessageCreated) -> None:
         )
         return
 
+    if text == "✏️ Исправить идею":
+        if message.user_id is None:
+            await message.answer("Не удалось определить пользователя.")
+            return
+        ideas_to_fix = await list_ideas_for_revision(message.user_id)
+        if not ideas_to_fix:
+            await message.answer(
+                "У вас нет идей, возвращённых на доработку.",
+                keyboard=user_context_keyboard(
+                    "💡 Подать идею",
+                    is_admin=await is_admin_user(message.user_id),
+                ),
+            )
+            return
+        pending_ideas[message.user_id] = {"step": "revision_id"}
+        lines = ["🛠 Идеи, которые нужно исправить:"]
+        for idea_id, title, moderator_comment in ideas_to_fix:
+            lines.append(
+                f"\n№{idea_id} · {title}\n"
+                f"Замечание: {moderator_comment or 'исправьте текст по замечанию модератора.'}"
+            )
+        lines.append("\nОтправьте номер идеи, которую хотите исправить.")
+        await message.answer("\n".join(lines), keyboard=cancel_keyboard())
+        return
+
     if message.user_id in pending_ideas:
         idea = pending_ideas[message.user_id]
         value = text.strip()
 
+        if idea["step"] == "revision_id":
+            if not value.isdigit():
+                await message.answer("Введите номер идеи из списка.", keyboard=cancel_keyboard())
+                return
+            revised_idea = await get_idea_for_revision(message.user_id, int(value))
+            if revised_idea is None:
+                await message.answer(
+                    "Не нашёл эту идею среди возвращённых вам на доработку. Проверьте номер.",
+                    keyboard=cancel_keyboard(),
+                )
+                return
+            title, description, target_group, age_group, moderator_comment = revised_idea
+            idea.update(
+                {
+                    "mode": "revision",
+                    "idea_id": value,
+                    "title": title,
+                    "description": description,
+                    "target_group": target_group,
+                    "age_group": age_group,
+                    "moderator_comment": moderator_comment,
+                    "step": "title",
+                }
+            )
+            await message.answer(
+                f"Идея №{value}. Замечание: "
+                f"{moderator_comment or 'проверьте текст и исправьте ошибки.'}\n\n"
+                f"Текущее название: {title}\n"
+                f"Текущее описание: {description}\n"
+                f"Для кого: {target_group}\n\n"
+                "Введите исправленное название (до 120 символов) или оставьте без изменений.",
+                keyboard=idea_revision_keyboard(),
+            )
+            return
+
         if idea["step"] == "title":
-            if not value or len(value) > 120:
+            unchanged = idea.get("mode") == "revision" and value == "⏭️ Оставить без изменений"
+            if not unchanged and (not value or len(value) > 120):
                 await message.answer("Название должно быть от 1 до 120 символов. Попробуйте ещё раз.")
                 return
-            idea["title"] = value
+            if not unchanged:
+                idea["title"] = value
             idea["step"] = "description"
             await message.answer(
-                "Шаг 2 из 3. Опишите идею (до 1000 символов).",
-                keyboard=cancel_keyboard(),
+                (
+                    "Шаг 2 из 3. Введите исправленное описание (до 1000 символов) "
+                    "или оставьте без изменений."
+                    if idea.get("mode") == "revision"
+                    else "Шаг 2 из 3. Опишите идею (до 1000 символов)."
+                ),
+                keyboard=(
+                    idea_revision_keyboard()
+                    if idea.get("mode") == "revision"
+                    else cancel_keyboard()
+                ),
             )
             return
 
         if idea["step"] == "description":
-            if not value or len(value) > 1000:
+            unchanged = idea.get("mode") == "revision" and value == "⏭️ Оставить без изменений"
+            if not unchanged and (not value or len(value) > 1000):
                 await message.answer("Описание должно быть от 1 до 1000 символов. Попробуйте ещё раз.")
                 return
-            idea["description"] = value
+            if not unchanged:
+                idea["description"] = value
             idea["step"] = "target_group"
             age_group = idea.get("age_group", "")
             await message.answer(
-                f"Шаг 3 из 3. Для кого подходит идея внутри вашей группы "
+                f"Шаг 3 из 3. "
+                f"{'Укажите исправленную аудиторию' if idea.get('mode') == 'revision' else 'Для кого подходит идея'} "
+                f"внутри вашей группы "
                 f"{AGE_GROUP_LABELS.get(age_group, age_group)}? "
                 "Укажите только классы из этого диапазона, например «все "
                 f"{AGE_GROUP_LABELS.get(age_group, age_group)}».",
-                keyboard=cancel_keyboard(),
+                keyboard=(
+                    idea_revision_keyboard()
+                    if idea.get("mode") == "revision"
+                    else cancel_keyboard()
+                ),
             )
             return
 
         if idea["step"] == "target_group":
+            if idea.get("mode") == "revision" and value == "⏭️ Оставить без изменений":
+                value = idea["target_group"]
             if not value or len(value) > 100:
                 await message.answer("Укажите группу длиной до 100 символов.")
                 return
@@ -1294,6 +1401,36 @@ async def echo_handler(message: MessageCreated) -> None:
                     keyboard=cancel_keyboard(),
                 )
                 return
+            if idea.get("mode") == "revision":
+                idea_id = int(idea["idea_id"])
+                updated = await update_idea_after_revision(
+                    message.user_id,
+                    idea_id,
+                    idea["title"],
+                    idea["description"],
+                    value,
+                )
+                if not updated:
+                    pending_ideas.pop(message.user_id, None)
+                    await message.answer(
+                        "Идею не удалось обновить. Возможно, она уже обработана.",
+                        keyboard=await entry_keyboard(message.user_id),
+                    )
+                    return
+                pending_ideas.pop(message.user_id, None)
+                await notify_moderators(
+                    f"🔄 Идея №{idea_id} исправлена автором и повторно отправлена на проверку.\n"
+                    f"Категория: {rating_label(idea['age_group'])}."
+                )
+                await message.answer(
+                    f"✅ Исправленная идея №{idea_id} отправлена на повторную проверку.",
+                    keyboard=user_context_keyboard(
+                        "💡 Подать идею",
+                        is_admin=await is_admin_user(message.user_id),
+                    ),
+                )
+                return
+
             idea_status, idea_id = await create_idea(
                 message.user_id,
                 idea["title"],
@@ -1998,7 +2135,32 @@ async def echo_handler(message: MessageCreated) -> None:
                 )
                 return
 
-        if kind == "setvalue":
+        if kind == "editvalue":
+            if form["step"] == "period":
+                month_label = value.split(" · ", maxsplit=1)[0]
+                if month_label not in form.get("period_choices", "").split(","):
+                    await message.answer("Выберите месяц кнопкой из списка.", keyboard=cancel_keyboard())
+                    return
+                try:
+                    period_month = date.fromisoformat(f"{month_label}-01")
+                except ValueError:
+                    await message.answer("Не удалось определить месяц. Откройте исправление заново.")
+                    pending_admin_forms.pop(message.user_id, None)
+                    return
+                current = await get_monthly_value(period_month)
+                if current is None:
+                    await message.answer("Этот месяц больше не найден. Откройте список заново.")
+                    pending_admin_forms.pop(message.user_id, None)
+                    return
+                form["period_month"] = month_label
+                form["previous_value"] = current[0]
+                form["step"] = "value"
+                await message.answer(
+                    f"Ценность за {period_month.strftime('%m.%Y')}: {current[0]}\n"
+                    "Введите исправленный текст.",
+                    keyboard=cancel_keyboard(),
+                )
+                return
             if form["step"] == "value":
                 if not value or len(value) > 200:
                     await message.answer("Ценность должна быть от 1 до 200 символов.")
@@ -2006,7 +2168,44 @@ async def echo_handler(message: MessageCreated) -> None:
                 form["value"] = value
                 form["step"] = "confirm"
                 await message.answer(
-                    f"Новая ценность месяца:\n{value}\n\nСохранить её?",
+                    f"Исправить ценность за {form['period_month']}?\n"
+                    f"Было: {form['previous_value']}\n"
+                    f"Будет: {value}\n\n"
+                    "Рейтинг, баллы и статус закрытия месяца не изменятся.",
+                    keyboard=confirmation_keyboard("✅ Сохранить исправление"),
+                )
+                return
+            if value == "✏️ Изменить":
+                form["step"] = "value"
+                await message.answer("Введите исправленную ценность заново.", keyboard=cancel_keyboard())
+                return
+            if value == "✅ Сохранить исправление":
+                text = f"/editvalue {form['period_month']}|{form['value']}"
+                pending_admin_forms.pop(message.user_id, None)
+            else:
+                await message.answer(
+                    "Нажмите «✅ Сохранить исправление» или «✏️ Изменить».",
+                    keyboard=confirmation_keyboard("✅ Сохранить исправление"),
+                )
+                return
+
+        if kind == "setvalue":
+            if form["step"] == "value":
+                if not value or len(value) > 200:
+                    await message.answer("Ценность должна быть от 1 до 200 символов.")
+                    return
+                form["value"] = value
+                form["step"] = "confirm"
+                previous_value = form.get("previous_value")
+                preview = (
+                    f"Текущая ценность месяца: {previous_value}\n"
+                    f"Новое значение: {value}\n\n"
+                    "Заменить ценность этого месяца? Баллы и рейтинг останутся без изменений."
+                    if previous_value
+                    else f"Новая ценность месяца:\n{value}\n\nСохранить её?"
+                )
+                await message.answer(
+                    preview,
                     keyboard=confirmation_keyboard("✅ Сохранить ценность"),
                 )
                 return
@@ -2225,20 +2424,24 @@ async def echo_handler(message: MessageCreated) -> None:
                 )
                 return
 
-        elif kind in {"reject_idea", "reject_report", "reject_teacher"}:
+        elif kind in {"reject_idea", "reject_report", "reject_teacher", "return_idea"}:
             command = {
                 "reject_idea": "/reject",
                 "reject_report": "/reject_report",
                 "reject_teacher": "/reject_teacher",
+                "return_idea": "/return_idea",
             }[kind]
             title = {
                 "reject_idea": "идею",
                 "reject_report": "отчёт",
                 "reject_teacher": "заявку учителя",
+                "return_idea": "идею",
             }[kind]
             confirm = (
                 "❌ Отклонить идею"
                 if kind == "reject_idea"
+                else "✏️ Вернуть на доработку"
+                if kind == "return_idea"
                 else (
                     "❌ Подтвердить отклонение заявки"
                     if kind == "reject_teacher"
@@ -2846,6 +3049,10 @@ async def echo_handler(message: MessageCreated) -> None:
             {"kind": "setvalue", "step": "value"},
             "Введите новую ценность месяца.",
         ),
+        "📝 Исправить ценность": (
+            {"kind": "editvalue", "step": "period"},
+            "Выберите месяц, в котором нужно исправить ценность.",
+        ),
         "📅 Добавить мероприятие": (
             {"kind": "addevent", "step": "title"},
             "Введите название мероприятия.",
@@ -2865,6 +3072,10 @@ async def echo_handler(message: MessageCreated) -> None:
         "❌ Отклонить идею": (
             {"kind": "reject_idea", "step": "id"},
             "Введите номер идеи.",
+        ),
+        "✏️ Вернуть идею на доработку": (
+            {"kind": "return_idea", "step": "id"},
+            "Введите номер идеи, которую нужно вернуть автору на доработку.",
         ),
         "✅ Одобрить отчёт": (
             {"kind": "approve_report", "step": "id"},
@@ -2973,6 +3184,33 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_admin_forms[message.user_id] = admin_form_starters[text][0]
         prompt = admin_form_starters[text][1]
         keyboard = cancel_keyboard()
+        if text == "⚙️ Ценность месяца":
+            current_value = await get_current_month_value()
+            if current_value:
+                pending_admin_forms[message.user_id]["previous_value"] = current_value
+                prompt = (
+                    f"Сейчас установлено: {current_value}\n"
+                    "Введите исправленный текст. Он заменит ценность текущего месяца."
+                )
+        if text == "📝 Исправить ценность":
+            monthly_values = await list_monthly_values()
+            if not monthly_values:
+                pending_admin_forms.pop(message.user_id, None)
+                await message.answer(
+                    "Пока нет сохранённых ценностей для исправления.",
+                    keyboard=admin_keyboard(),
+                )
+                return
+            period_labels = [
+                f"{period_month.strftime('%Y-%m')} · {value[:45]} · "
+                f"{'открыт' if status == 'open' else 'закрыт'}"
+                for period_month, value, status in monthly_values
+            ]
+            pending_admin_forms[message.user_id]["period_choices"] = ",".join(
+                period_month.strftime("%Y-%m")
+                for period_month, _value, _status in monthly_values
+            )
+            keyboard = options_keyboard(*period_labels, "↩️ Отмена")
         if text == "⚙️ Лимиты":
             keyboard = options_keyboard(
                 "💡 Лимит идей",
@@ -3198,6 +3436,34 @@ async def echo_handler(message: MessageCreated) -> None:
         await message.answer(
             f"Лимит {parts[0]} установлен: {limit} в месяц.",
             keyboard=context_keyboard("limit"),
+        )
+        return
+
+    if text == "/editvalue" or text.startswith("/editvalue "):
+        if not await is_admin_user(message.user_id):
+            await message.answer("У вас нет прав администратора.")
+            return
+        parts = text.removeprefix("/editvalue").strip().split("|", maxsplit=1)
+        if len(parts) != 2 or not re.fullmatch(r"\d{4}-\d{2}", parts[0].strip()):
+            await message.answer("Формат: /editvalue ГГГГ-ММ|Новое значение")
+            return
+        value = parts[1].strip()
+        if not 1 <= len(value) <= 200:
+            await message.answer("Ценность должна быть от 1 до 200 символов.")
+            return
+        try:
+            period_month = date.fromisoformat(f"{parts[0].strip()}-01")
+        except ValueError:
+            await message.answer("Укажите существующий месяц в формате ГГГГ-ММ.")
+            return
+        updated = await correct_monthly_value(period_month, value)
+        if not updated:
+            await message.answer("Не удалось найти этот месяц для исправления.")
+            return
+        await message.answer(
+            f"Ценность за {period_month.strftime('%m.%Y')} исправлена: {value}\n"
+            "Рейтинг, баллы и статус закрытия месяца не изменились.",
+            keyboard=context_keyboard("value"),
         )
         return
 
@@ -3519,16 +3785,71 @@ async def echo_handler(message: MessageCreated) -> None:
             await message.answer("Очередь идей пуста.", keyboard=context_keyboard("idea"))
             return
         lines = ["📝 Идеи на модерации:"]
-        for idea_id, title, description, target_group, class_name, age_group in ideas:
+        for (
+            idea_id,
+            title,
+            description,
+            target_group,
+            class_name,
+            age_group,
+            moderator_comment,
+        ) in ideas:
             lines.append(
                 f"\n№{idea_id} · группа {AGE_GROUP_LABELS.get(age_group, age_group)} "
                 f"· класс {class_name}\n"
                 f"{title}\n{description}\nДля: {target_group}"
+                + (
+                    f"\nПредыдущее замечание: {moderator_comment}"
+                    if moderator_comment
+                    else ""
+                )
             )
         await message.answer(
             "\n".join(lines),
             keyboard=context_keyboard("idea") if await is_admin_user(message.user_id) else main_keyboard(),
         )
+        return
+
+    if text == "/return_idea" or text.startswith("/return_idea "):
+        if not is_moderator:
+            await message.answer("У вас нет прав модератора.")
+            return
+        parts = text.split(maxsplit=2)
+        if (
+            len(parts) != 3
+            or not parts[1].isdigit()
+            or not parts[2].strip()
+            or len(parts[2].strip()) > 500
+        ):
+            await message.answer(
+                "Формат: /return_idea Номер Причина для доработки"
+            )
+            return
+        idea_id = int(parts[1])
+        comment = parts[2].strip()
+        author_id = await get_idea_author_id(idea_id)
+        changed, status, _event_id = await moderate_idea(
+            idea_id,
+            message.user_id,
+            "needs_revision",
+            comment,
+        )
+        if not changed:
+            await message.answer("Идея не найдена или уже обработана.")
+            return
+        await message.answer(
+            f"Идея №{idea_id} возвращена автору на доработку. Комментарий отправлен.",
+            keyboard=context_keyboard("idea") if await is_admin_user(message.user_id) else main_keyboard(),
+        )
+        if author_id is not None:
+            await notify_user(
+                author_id,
+                f"🛠 Идея №{idea_id} возвращена на доработку.\n"
+                f"Замечание: {comment}\n\n"
+                "Исправьте нужные поля через кнопку «✏️ Исправить идею»; "
+                "остальные можно оставить без изменений.",
+                keyboard=user_context_keyboard("✏️ Исправить идею"),
+            )
         return
 
     if text == "/approve" or text.startswith("/approve "):

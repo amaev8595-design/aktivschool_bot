@@ -2004,6 +2004,76 @@ async def get_current_month_value() -> str | None:
         await connection.close()
 
 
+async def list_monthly_values() -> list[tuple[date, str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT period_month, monthly_value, status
+            FROM rating_periods
+            ORDER BY period_month DESC
+            """
+        )
+        return [
+            (row["period_month"], row["monthly_value"], row["status"])
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
+async def get_monthly_value(period_month: date) -> tuple[str, str] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT monthly_value, status
+            FROM rating_periods
+            WHERE period_month = $1
+            """,
+            period_month,
+        )
+        if row is None:
+            return None
+        return row["monthly_value"], row["status"]
+    finally:
+        await connection.close()
+
+
+async def correct_monthly_value(period_month: date, value: str) -> bool:
+    value = value.strip()
+    if not 1 <= len(value) <= 200:
+        return False
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                """
+                UPDATE rating_periods
+                SET monthly_value = $2
+                WHERE period_month = $1
+                RETURNING id
+                """,
+                period_month,
+                value,
+            )
+            if row is None:
+                return False
+            if period_month == month_start(moscow_today()):
+                await connection.execute(
+                    """
+                    INSERT INTO settings (key, value, updated_at)
+                    VALUES ('monthly_value', $1::jsonb, NOW())
+                    ON CONFLICT (key)
+                    DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                    """,
+                    json.dumps(value, ensure_ascii=False),
+                )
+            return True
+    finally:
+        await connection.close()
+
+
 async def get_admin_month_dashboard() -> dict[str, object]:
     connection = await asyncpg.connect(get_database_url())
     try:
@@ -2532,14 +2602,14 @@ async def create_idea(
         await connection.close()
 
 
-async def list_pending_ideas() -> list[tuple[int, str, str, str, str, str]]:
+async def list_pending_ideas() -> list[tuple[int, str, str, str, str, str, str | None]]:
     connection = await asyncpg.connect(get_database_url())
     try:
         rows = await connection.fetch(
             """
             SELECT ideas.id, ideas.title, ideas.description,
                    ideas.target_group, classes.name AS class_name,
-                   classes.age_group
+                   classes.age_group, ideas.moderator_comment
             FROM ideas
             JOIN classes ON classes.id = ideas.author_class_id
             WHERE ideas.status = 'pending'
@@ -2554,9 +2624,96 @@ async def list_pending_ideas() -> list[tuple[int, str, str, str, str, str]]:
                 row["target_group"],
                 row["class_name"],
                 row["age_group"],
+                row["moderator_comment"],
             )
             for row in rows
         ]
+    finally:
+        await connection.close()
+
+
+async def list_ideas_for_revision(max_user_id: int) -> list[tuple[int, str, str]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT id, title, COALESCE(moderator_comment, '') AS moderator_comment
+            FROM ideas
+            WHERE author_user_id = $1 AND status = 'needs_revision'
+            ORDER BY updated_at DESC, id DESC
+            """,
+            max_user_id,
+        )
+        return [
+            (int(row["id"]), row["title"], row["moderator_comment"])
+            for row in rows
+        ]
+    finally:
+        await connection.close()
+
+
+async def get_idea_for_revision(
+    max_user_id: int, idea_id: int
+) -> tuple[str, str, str, str, str] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        row = await connection.fetchrow(
+            """
+            SELECT ideas.title, ideas.description, ideas.target_group,
+                   classes.age_group,
+                   COALESCE(ideas.moderator_comment, '') AS moderator_comment
+            FROM ideas
+            JOIN classes ON classes.id = ideas.author_class_id
+            WHERE ideas.id = $1
+              AND ideas.author_user_id = $2
+              AND ideas.status = 'needs_revision'
+            """,
+            idea_id,
+            max_user_id,
+        )
+        if row is None:
+            return None
+        return (
+            row["title"],
+            row["description"],
+            row["target_group"],
+            row["age_group"],
+            row["moderator_comment"],
+        )
+    finally:
+        await connection.close()
+
+
+async def update_idea_after_revision(
+    max_user_id: int,
+    idea_id: int,
+    title: str,
+    description: str,
+    target_group: str,
+) -> bool:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                """
+                UPDATE ideas
+                SET title = $3,
+                    description = $4,
+                    target_group = $5,
+                    status = 'pending',
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND author_user_id = $2
+                  AND status = 'needs_revision'
+                RETURNING id
+                """,
+                idea_id,
+                max_user_id,
+                title,
+                description,
+                target_group,
+            )
+            return row is not None
     finally:
         await connection.close()
 
@@ -2658,6 +2815,19 @@ async def moderate_idea(
                     row["author_class_id"],
                 )
                 return True, "approved", int(event["id"])
+
+            if decision == "needs_revision":
+                await connection.execute(
+                    """
+                    UPDATE ideas
+                    SET status = 'needs_revision', moderator_comment = $2,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    idea_id,
+                    comment,
+                )
+                return True, "needs_revision", None
 
             await connection.execute(
                 """
