@@ -3,7 +3,8 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager, suppress
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI
 
@@ -35,7 +36,11 @@ from db import (
     get_user_class,
     get_monthly_bonus_status,
     get_current_month_value,
+    get_admin_month_dashboard,
+    get_deadline_reminder_info,
+    get_class_rating_breakdown,
     get_month_rating,
+    get_school_year_rollover_preview,
     get_report_submitter_id,
     initialize_database,
     list_classes_with_codes,
@@ -60,6 +65,8 @@ from db import (
     set_user_role,
     set_monthly_value,
     set_setting,
+    mark_deadline_reminder_sent,
+    rollover_school_year,
     signup_for_event,
     undo_rating_action,
 )
@@ -100,8 +107,10 @@ pending_report_selection_users: set[int] = set()
 pending_user_reports: dict[int, dict[str, str]] = {}
 pending_teacher_forms: dict[int, dict[str, str]] = {}
 pending_teacher_penalties: dict[int, dict[str, str]] = {}
-pending_rating_context: dict[int, dict[str, str]] = {}
+pending_rating_context: dict[int, dict[str, object]] = {}
+pending_school_year_rollover: dict[int, dict[str, str]] = {}
 BOT_MODE = os.getenv("BOT_MODE", "polling").strip().lower()
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 AGE_GROUP_LABELS = {
     "1-4": "1–4 классы",
@@ -124,11 +133,13 @@ def media_tokens(message: MessageCreated) -> str | None:
     return ",".join(tokens) if tokens else None
 
 
-async def notify_user(user_id: int, text: str) -> None:
+async def notify_user(user_id: int, text: str) -> bool:
     try:
         await bot.send_message(user_id=user_id, text=text)
+        return True
     except Exception as error:  # noqa: BLE001 - уведомление не должно останавливать бота
         print(f"Не удалось отправить уведомление пользователю {user_id}: {error}")
+        return False
 
 
 async def notify_moderators(text: str) -> None:
@@ -192,9 +203,11 @@ def admin_keyboard():
         .add_message(text="🎁 Дополнительные баллы")
         .add_message(text="🧾 Журнал начислений")
         .add_message(text="⚙️ Лимиты")
+        .add_message(text="📊 Панель месяца")
+        .add_message(text="🔄 Новый учебный год")
         .add_message(text="↩️ Главное меню")
     )
-    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1).build()
+    return keyboard.adjust(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1).build()
 
 
 def class_group_keyboard():
@@ -348,6 +361,29 @@ def rating_group_keyboard(age_groups: list[str], is_admin: bool = False):
     return user_context_keyboard(*labels, is_admin=is_admin)
 
 
+RATING_DETAIL_PAGE_SIZE = 20
+
+
+def rating_detail_keyboard(class_names: list[str], page: int, is_admin: bool = False):
+    start = page * RATING_DETAIL_PAGE_SIZE
+    page_names = class_names[start : start + RATING_DETAIL_PAGE_SIZE]
+    labels = [f"🔎 {name}" for name in page_names]
+    if start > 0:
+        labels.append("⬅️ Предыдущие классы")
+    if start + RATING_DETAIL_PAGE_SIZE < len(class_names):
+        labels.append("➡️ Следующие классы")
+    labels.extend([
+        "📊 Рейтинг текущего месяца",
+        "🏅 Рейтинг учебного года",
+        "📅 История рейтингов",
+        "↩️ К рейтингу",
+        "↩️ Выбрать категорию",
+    ])
+    if is_admin:
+        labels.append("⚙️ Администрирование")
+    return options_keyboard(*labels)
+
+
 async def available_rating_groups(user_id: int) -> list[str]:
     if await is_moderator_user(user_id):
         return list(AGE_GROUP_LABELS)
@@ -421,10 +457,21 @@ async def show_current_month_rating(message: MessageCreated, age_group: str) -> 
             last_points = points
         badge = "🏆 " if is_winner else ""
         lines.append(f"{current_rank}. {badge}{name} — {points} баллов")
+    class_names = [name for name, _group, _points, _winner in rating]
+    pending_rating_context[message.user_id] = {
+        "step": "class_details",
+        "age_group": age_group,
+        "view": "month",
+        "period_month": period_month.isoformat(),
+        "academic_year": f"{period_month.year if period_month.month >= 9 else period_month.year - 1}/"
+        f"{period_month.year + 1 if period_month.month >= 9 else period_month.year}",
+        "class_names": class_names,
+        "page": 0,
+    }
     await answer_lines(
         message,
         lines,
-        rating_keyboard(await is_admin_user(message.user_id)),
+        rating_detail_keyboard(class_names, 0, await is_admin_user(message.user_id)),
     )
 
 
@@ -445,10 +492,22 @@ async def show_academic_year_rating(message: MessageCreated, age_group: str) -> 
             last_points = points
         badge = "👑 " if is_winner else ""
         lines.append(f"{current_rank}. {badge}{name} — {points} баллов")
+    start_year = int(year_label.split("/", 1)[0])
+    class_names = [name for name, _group, _points, _winner in rating]
+    pending_rating_context[message.user_id] = {
+        "step": "class_details",
+        "age_group": age_group,
+        "view": "year",
+        "academic_year": year_label,
+        "period_start": date(start_year, 9, 1).isoformat(),
+        "period_end": date(start_year + 1, 5, 1).isoformat(),
+        "class_names": class_names,
+        "page": 0,
+    }
     await answer_lines(
         message,
         lines,
-        rating_keyboard(await is_admin_user(message.user_id)),
+        rating_detail_keyboard(class_names, 0, await is_admin_user(message.user_id)),
     )
 
 
@@ -504,11 +563,224 @@ async def show_archived_month_rating(
             rank, last_points = position, points
         badge = "🏆 " if winner else ""
         lines.append(f"{rank}. {badge}{name} — {points} баллов")
+    class_names = [name for name, _group, _points, _winner in rating]
+    year_start = period_month.year if period_month.month >= 9 else period_month.year - 1
+    pending_rating_context[message.user_id] = {
+        "step": "class_details",
+        "age_group": age_group,
+        "view": "archived_month",
+        "period_month": period_month.isoformat(),
+        "academic_year": f"{year_start}/{year_start + 1}",
+        "class_names": class_names,
+        "page": 0,
+    }
     await answer_lines(
         message,
         lines,
-        rating_keyboard(await is_admin_user(message.user_id)),
+        rating_detail_keyboard(class_names, 0, await is_admin_user(message.user_id)),
     )
+
+
+async def show_rating_class_details(
+    message: MessageCreated,
+    class_name: str,
+) -> None:
+    user_id = message.user_id
+    state = pending_rating_context.get(user_id)
+    if not state or state.get("step") != "class_details":
+        await begin_rating_selection(message)
+        return
+    class_names = state.get("class_names", [])
+    if not isinstance(class_names, list) or class_name not in class_names:
+        await message.answer("Выберите класс кнопкой из показанного рейтинга.")
+        return
+    age_group = str(state.get("age_group", ""))
+    if age_group not in await available_rating_groups(user_id):
+        await begin_rating_selection(message)
+        return
+    if state.get("view") in {"month", "archived_month"}:
+        period_month = date.fromisoformat(str(state["period_month"]))
+        period_start = period_month
+        period_end = period_month
+        period_label = period_month.strftime("%m.%Y")
+    else:
+        period_start = date.fromisoformat(str(state["period_start"]))
+        period_end = date.fromisoformat(str(state["period_end"]))
+        period_label = str(state.get("academic_year", "учебный год"))
+
+    breakdown = await get_class_rating_breakdown(
+        class_name,
+        age_group,
+        str(state["academic_year"]),
+        period_start,
+        period_end,
+    )
+    if breakdown is None:
+        await message.answer("Не удалось найти класс в этом учебном году.")
+        return
+
+    lines = [
+        f"🔎 Класс {class_name} · {rating_label(age_group)}",
+        f"Период: {period_label}",
+        f"Всего: {breakdown['total']} баллов",
+        "",
+    ]
+    categories = breakdown["categories"]
+    for key in ("reports", "ideas", "prizes", "bonuses", "other"):
+        bucket = categories[key]
+        lines.append(
+            f"{bucket['label']}: {bucket['points']} баллов · записей: {bucket['count']}"
+        )
+        entries = bucket["entries"]
+        for entry in entries[-5:]:
+            lines.append(f"  • {entry['reason']} — {entry['points']} б.")
+        if len(entries) > 5:
+            lines.append(f"  • Ещё записей: {len(entries) - 5}")
+
+    penalties = breakdown["penalties"]
+    lines.append(f"\n⚠️ Дисциплинарные замечания: {len(penalties)}")
+    for penalty in penalties[-10:]:
+        month_label = penalty["period_month"].strftime("%m.%Y")
+        note = (penalty["note"] or "").strip()
+        detail = f" · {note}" if note else ""
+        lines.append(
+            f"  • {month_label} · учитель ID {penalty['teacher_max_user_id']}{detail}"
+        )
+    if len(penalties) > 10:
+        lines.append(f"  • Ещё замечаний: {len(penalties) - 10}")
+
+    await message.answer(
+        "\n".join(lines),
+        keyboard=options_keyboard(
+            "📊 Рейтинг текущего месяца",
+            "🏅 Рейтинг учебного года",
+            "📅 История рейтингов",
+            "↩️ К рейтингу",
+            "↩️ Выбрать категорию",
+            *(["⚙️ Администрирование"] if await is_admin_user(user_id) else []),
+        ),
+    )
+
+
+async def send_month_dashboard(message: MessageCreated) -> None:
+    data = await get_admin_month_dashboard()
+    current_status = {
+        "open": "открыт",
+        "closed": "закрыт",
+        "not_open": "ещё не открыт",
+    }.get(str(data["current_status"]), str(data["current_status"]))
+    report_status = {
+        "open": "приём открыт",
+        "closed": "срок истёк, месяц закрыт",
+        "not_open": "месяц ещё не открыт",
+    }.get(str(data["report_status"]), str(data["report_status"]))
+    previous_status = {
+        "open": "ещё открыт для отчётов",
+        "closed": "закрыт",
+        "not_open": "не открывался",
+    }.get(str(data["previous_status"]), str(data["previous_status"]))
+    value = data["current_value"] or "не задана"
+    current_month = data["current_month"].strftime("%m.%Y")
+    report_month = data["report_month"].strftime("%m.%Y")
+    deadline = data["report_deadline"].strftime("%d.%m.%Y")
+    await message.answer(
+        f"📊 Панель месяца · {current_month}\n\n"
+        f"🎯 Ценность: {value}\n"
+        f"🔒 Статус месяца: {current_status}\n"
+        f"📅 Предыдущий месяц ({data['previous_month'].strftime('%m.%Y')}): {previous_status}\n"
+        f"📋 Отчёты за {report_month}: до {deadline} включительно · {report_status}\n\n"
+        "⏳ На проверке:\n"
+        f"• заявки учителей: {data['pending_teacher_applications']}\n"
+        f"• отчёты: {data['pending_reports']}\n"
+        f"• идеи: {data['pending_ideas']}",
+        keyboard=admin_keyboard(),
+    )
+
+
+async def send_school_year_rollover_preview(message: MessageCreated) -> None:
+    preview = await get_school_year_rollover_preview()
+    lines = [
+        "🔄 Подготовка нового учебного года",
+        f"Переход: {preview['from_year']} → {preview['to_year']}",
+    ]
+    if preview["already_done"]:
+        lines.append("Этот учебный год уже переводили.")
+        await message.answer("\n".join(lines), keyboard=admin_keyboard())
+        return
+    if not preview["promote"] and not preview["graduate"]:
+        lines.append("В текущем учебном году нет активных классов для переноса.")
+        await message.answer("\n".join(lines), keyboard=admin_keyboard())
+        return
+    lines.extend([
+        f"Классы для перевода: {len(preview['promote'])}",
+        f"Выпускные классы 11-х: {len(preview['graduate'])}",
+        f"Учеников и учителей переместится: {preview['moved_users']}",
+        f"Назначений учителей будет перенесено: {preview['teacher_assignments']}",
+        f"Заявок учителей затронет: {preview['pending_teacher_applications']}",
+        f"Заявок без продолжающегося класса будет закрыто: {len(preview['rejected_applicants'])}",
+        f"Пользователей 11-х классов отвяжется: {preview['unassigned_users']}",
+        "",
+    ])
+    lines.extend(
+        f"• {old_name} → {new_name}"
+        for _class_id, old_name, new_name, _group in preview["promote"]
+    )
+    if preview["graduate"]:
+        lines.append("\nАрхив выпускных классов: " + ", ".join(
+            name for _class_id, name in preview["graduate"]
+        ))
+    lines.append(
+        "\nИстория баллов останется у старых классов. Ученики 11-х будут отвязаны; "
+        "новые 1-е классы добавляются отдельно после перехода."
+    )
+    if preview["errors"]:
+        lines.append("\nПереход пока невозможен:")
+        lines.extend(f"• {error}" for error in preview["errors"])
+        await answer_lines(message, lines, admin_keyboard())
+        return
+    pending_school_year_rollover[message.user_id] = {
+        "from_year": str(preview["from_year"]),
+        "preview_token": str(preview["preview_token"]),
+    }
+    await answer_lines(
+        message,
+        lines,
+        options_keyboard("✅ Выполнить переход", "↩️ Отмена"),
+    )
+
+
+async def send_deadline_reminder_if_due() -> None:
+    now = datetime.now(MOSCOW_TZ)
+    if now.hour < 9 or now.day not in {1, 3, 5}:
+        return
+    reminder = await get_deadline_reminder_info(now.date())
+    if reminder is None:
+        return
+    period_month, pending_reports, sent_to = reminder
+    recipients = set(get_admin_ids())
+    recipients.update(await list_user_ids_by_roles({"admin"}))
+    recipients.difference_update(sent_to)
+    if not recipients:
+        return
+    if now.day == 5:
+        deadline_text = "Сегодня последний день приёма отчётов."
+    else:
+        deadline_text = "Отчёты принимаются до 5-го числа включительно."
+    text = (
+        f"⏰ Напоминание: проверьте отчёты за {period_month.strftime('%m.%Y')}.\n"
+        f"{deadline_text}\n"
+        f"Непроверенных отчётов за этот месяц: {pending_reports}.\n"
+        "Откройте в боте «📊 Панель месяца» для проверки очередей."
+    )
+    recipient_ids = sorted(recipients)
+    results = await asyncio.gather(
+        *(notify_user(user_id, text) for user_id in recipient_ids)
+    )
+    await asyncio.gather(*(
+        mark_deadline_reminder_sent(now.date(), user_id)
+        for user_id, sent in zip(recipient_ids, results)
+        if sent
+    ))
 
 
 def event_entry_keyboard(is_admin: bool = False):
@@ -774,6 +1046,7 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_teacher_forms.pop(message.user_id, None)
         pending_teacher_penalties.pop(message.user_id, None)
         pending_rating_context.pop(message.user_id, None)
+        pending_school_year_rollover.pop(message.user_id, None)
         await message.answer(
             "Текущий сценарий отменён.",
             keyboard=await entry_keyboard(message.user_id),
@@ -808,7 +1081,133 @@ async def echo_handler(message: MessageCreated) -> None:
         pending_teacher_forms.pop(message.user_id, None)
         pending_teacher_penalties.pop(message.user_id, None)
         pending_rating_context.pop(message.user_id, None)
+        pending_school_year_rollover.pop(message.user_id, None)
         await start_handler(message)
+        return
+
+    if message.user_id in pending_school_year_rollover:
+        if text == "✅ Выполнить переход":
+            if not await is_admin_user(message.user_id):
+                pending_school_year_rollover.pop(message.user_id, None)
+                await message.answer("Переход учебного года доступен только администраторам.")
+                return
+            expected = pending_school_year_rollover.pop(message.user_id)
+            status, result = await rollover_school_year(
+                expected["from_year"],
+                expected["preview_token"],
+                message.user_id,
+            )
+            if status == "ok":
+                await message.answer(
+                    f"✅ Учебный год переведён: {result['from_year']} → {result['to_year']}.\n"
+                    f"Создано классов-переходов: {len(result['promote'])}. "
+                    f"Архивировано 11-х классов: {len(result['graduate'])}.\n"
+                    f"Перемещено пользователей: {result['moved_users']}; "
+                    f"отвязано выпускников: {result['unassigned_users']}.\n\n"
+                    "Новые коды классов и учителей доступны в разделах «📚 Классы» "
+                    "и «🔑 Коды учителей». Создайте новые 1-е классы отдельно.",
+                    keyboard=admin_keyboard(),
+                )
+                for applicant_id in result["rejected_applicants"]:
+                    await notify_user(
+                        applicant_id,
+                        "Заявку на регистрацию учителя закрыли при подготовке нового учебного года: "
+                        "указанный класс 11-го года выпуска завершён, а в заявке не осталось "
+                        "других действующих классов. Попросите администратора создать новый код приглашения.",
+                    )
+            elif status == "already_done":
+                await message.answer("Этот учебный год уже переводили.", keyboard=admin_keyboard())
+            elif status == "conflict":
+                lines = ["Переход не выполнен. Исправьте проблемы и повторите просмотр:"]
+                lines.extend(f"• {error}" for error in result["errors"])
+                await message.answer("\n".join(lines), keyboard=admin_keyboard())
+            elif status == "year_changed":
+                await message.answer(
+                    "Текущий учебный год уже изменился. Откройте переход заново.",
+                    keyboard=admin_keyboard(),
+                )
+            elif status == "preview_changed":
+                await message.answer(
+                    "Данные изменились после предварительного просмотра. Переход не выполнен. "
+                    "Откройте «🔄 Новый учебный год» и проверьте обновлённый список.",
+                    keyboard=admin_keyboard(),
+                )
+            else:
+                await message.answer(
+                    "Не удалось выполнить переход: в текущем учебном году нет активных классов.",
+                    keyboard=admin_keyboard(),
+                )
+            return
+        if text != "↩️ Отмена":
+            await message.answer(
+                "Подтвердите переход кнопкой или нажмите «↩️ Отмена».",
+                keyboard=options_keyboard("✅ Выполнить переход", "↩️ Отмена"),
+            )
+            return
+
+    if text == "📊 Панель месяца":
+        if not await is_admin_user(message.user_id):
+            await message.answer("Раздел доступен только администраторам.")
+            return
+        pending_admin_forms.pop(message.user_id, None)
+        pending_admin_actions.pop(message.user_id, None)
+        await send_month_dashboard(message)
+        return
+
+    if text == "🔄 Новый учебный год":
+        if not await is_admin_user(message.user_id):
+            await message.answer("Переход учебного года доступен только администраторам.")
+            return
+        pending_admin_forms.pop(message.user_id, None)
+        pending_admin_actions.pop(message.user_id, None)
+        await send_school_year_rollover_preview(message)
+        return
+
+    if text in {"🏆 Рейтинг", "↩️ Выбрать категорию"}:
+        pending_admin_forms.pop(message.user_id, None)
+        await begin_rating_selection(message)
+        return
+
+    rating_state = pending_rating_context.get(message.user_id)
+    if text.startswith("🔎 "):
+        pending_admin_forms.pop(message.user_id, None)
+        await show_rating_class_details(message, text.removeprefix("🔎 ").strip())
+        return
+    if text in {"➡️ Следующие классы", "⬅️ Предыдущие классы"}:
+        if rating_state and rating_state.get("step") == "class_details":
+            names = rating_state.get("class_names", [])
+            if isinstance(names, list):
+                current_page = int(rating_state.get("page", 0))
+                delta = 1 if text.startswith("➡️") else -1
+                page = max(0, min((len(names) - 1) // RATING_DETAIL_PAGE_SIZE, current_page + delta))
+                rating_state["page"] = page
+                await message.answer(
+                    "Выберите класс, чтобы посмотреть состав баллов:",
+                    keyboard=rating_detail_keyboard(
+                        names, page, await is_admin_user(message.user_id)
+                    ),
+                )
+                return
+    if text == "↩️ К рейтингу" and rating_state:
+        pending_admin_forms.pop(message.user_id, None)
+        age_group = str(rating_state.get("age_group", ""))
+        view = rating_state.get("view")
+        if view == "month":
+            await show_current_month_rating(message, age_group)
+        elif view == "year":
+            await show_academic_year_rating(message, age_group)
+        elif view == "archived_month":
+            await show_archived_month_rating(
+                message,
+                date.fromisoformat(str(rating_state["period_month"])),
+                age_group,
+            )
+        else:
+            await begin_rating_selection(message)
+        return
+    if text == "↩️ Выбрать категорию" and rating_state and rating_state.get("step") == "class_details":
+        pending_admin_forms.pop(message.user_id, None)
+        await begin_rating_selection(message)
         return
 
     if message.user_id in pending_users_role:
@@ -2672,8 +3071,9 @@ async def echo_handler(message: MessageCreated) -> None:
         }
         lines = ["🔑 Коды учителей:"]
         lines.extend(
-            f"{code} — класс {class_name} — {status_labels.get(status, status)}"
-            for code, class_name, status in invites
+            f"{code} — класс {class_name} ({academic_year}) — "
+            f"{status_labels.get(status, status)}"
+            for code, class_name, academic_year, status in invites
         )
         await message.answer("\n".join(lines), keyboard=context_keyboard("teacher_codes"))
         return
@@ -3288,10 +3688,6 @@ async def echo_handler(message: MessageCreated) -> None:
             )
         return
 
-    if text in {"🏆 Рейтинг", "↩️ Выбрать категорию"}:
-        await begin_rating_selection(message)
-        return
-
     selected_age_group = next(
         (group for group, label in AGE_GROUP_LABELS.items() if text == label),
         None,
@@ -3437,14 +3833,19 @@ async def prepare_database() -> None:
 async def rating_maintenance():
     # Catch up after downtime before accepting updates, then check every minute.
     await close_expired_months()
+    await send_deadline_reminder_if_due()
 
     async def check_deadlines():
         while True:
             await asyncio.sleep(60)
             try:
                 await close_expired_months()
+                await send_deadline_reminder_if_due()
             except Exception as error:
-                logging.error("Не удалось закрыть месяц (%s), повтор через минуту", type(error).__name__)
+                logging.error(
+                    "Не удалось проверить закрытие месяца или напоминание (%s), повтор через минуту",
+                    type(error).__name__,
+                )
 
     task = asyncio.create_task(check_deadlines())
     try:

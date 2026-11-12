@@ -1,8 +1,10 @@
 import csv
+import hashlib
 import json
 import os
+import re
 import secrets
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -82,18 +84,28 @@ def get_database_url() -> str:
 
 
 async def seed_classes(connection: asyncpg.Connection) -> None:
+    active_year = await connection.fetchval(
+        "SELECT value #>> '{}' FROM settings WHERE key = 'active_school_year'"
+    )
+    existing = await connection.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM classes WHERE academic_year = $1 AND archived = FALSE)",
+        active_year,
+    )
+    if existing:
+        return
     path = Path(__file__).parent / "data" / "classes.csv"
     with path.open(encoding="utf-8", newline="") as file:
         for row in csv.DictReader(file):
             await connection.execute(
                 """
-                INSERT INTO classes (name, age_group, invite_code)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (name) DO NOTHING
+                INSERT INTO classes (name, age_group, invite_code, academic_year)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT DO NOTHING
                 """,
                 row["name"].strip(),
                 row["age_group"].strip(),
                 row["invite_code"].strip().upper(),
+                active_year,
             )
 
 
@@ -345,12 +357,13 @@ async def create_teacher_invite(class_name: str) -> tuple[str, str] | None:
         await connection.close()
 
 
-async def list_teacher_invites() -> list[tuple[str, str, str]]:
+async def list_teacher_invites() -> list[tuple[str, str, str, str]]:
     connection = await asyncpg.connect(get_database_url())
     try:
         rows = await connection.fetch(
             """
             SELECT teacher_invites.code, classes.name AS class_name,
+                   classes.academic_year,
                    teacher_invites.status
             FROM teacher_invites
             JOIN classes ON classes.id = teacher_invites.class_id
@@ -358,7 +371,7 @@ async def list_teacher_invites() -> list[tuple[str, str, str]]:
             """
         )
         return [
-            (row["code"], row["class_name"], row["status"])
+            (row["code"], row["class_name"], row["academic_year"], row["status"])
             for row in rows
         ]
     finally:
@@ -724,8 +737,11 @@ async def create_class(name: str, age_group: str, invite_code: str) -> bool:
         try:
             await connection.execute(
                 """
-                INSERT INTO classes (name, age_group, invite_code)
-                VALUES ($1, $2, $3)
+                INSERT INTO classes (name, age_group, invite_code, academic_year)
+                VALUES (
+                    $1, $2, $3,
+                    (SELECT value #>> '{}' FROM settings WHERE key = 'active_school_year')
+                )
                 """,
                 name,
                 age_group,
@@ -734,6 +750,423 @@ async def create_class(name: str, age_group: str, invite_code: str) -> bool:
         except asyncpg.UniqueViolationError:
             return False
         return True
+    finally:
+        await connection.close()
+
+
+def _age_group_for_grade(grade: int) -> str:
+    if grade <= 4:
+        return "1-4"
+    if grade <= 8:
+        return "5-8"
+    return "9-11"
+
+
+def _next_grade_class_name(class_name: str) -> tuple[int, str] | None:
+    match = re.fullmatch(r"\s*(\d{1,2})\s*(.*?)\s*", class_name)
+    if match is None:
+        return None
+    grade = int(match.group(1))
+    if not 1 <= grade <= 11:
+        return None
+    return grade, f"{grade + 1}{match.group(2).strip()}"
+
+
+async def _school_year_rollover_preview(
+    connection: asyncpg.Connection,
+    source_year: str,
+) -> dict[str, object]:
+    source_start = int(source_year.split("/", 1)[0])
+    target_year = f"{source_start + 1}/{source_start + 2}"
+    prior = await connection.fetchrow(
+        "SELECT to_year FROM school_year_rollovers WHERE from_year = $1",
+        source_year,
+    )
+    rows = await connection.fetch(
+        """
+        SELECT id, name, age_group
+        FROM classes
+        WHERE academic_year = $1 AND archived = FALSE
+        ORDER BY name
+        """,
+        source_year,
+    )
+    errors: list[str] = []
+    promote: list[tuple[int, str, str, str]] = []
+    graduate: list[tuple[int, str]] = []
+    for row in rows:
+        parsed = _next_grade_class_name(row["name"])
+        if parsed is None:
+            errors.append(f"Не удалось определить параллель класса «{row['name']}».")
+            continue
+        grade, next_name = parsed
+        if grade == 11:
+            graduate.append((int(row["id"]), row["name"]))
+        else:
+            promote.append(
+                (int(row["id"]), row["name"], next_name, _age_group_for_grade(grade + 1))
+            )
+
+    next_names = [row[2] for row in promote]
+    collisions = await connection.fetch(
+        """
+        SELECT name, academic_year FROM classes
+        WHERE archived = FALSE AND academic_year <> $1 AND name = ANY($2::text[])
+        """,
+        source_year,
+        next_names,
+    ) if next_names else []
+    for row in collisions:
+        errors.append(
+            f"Активный класс «{row['name']}» уже есть в учебном году {row['academic_year']}."
+        )
+
+    user_counts = await connection.fetchrow(
+        """
+        SELECT COUNT(*) FILTER (WHERE class_id = ANY($1::bigint[]))::int AS all_users,
+               COUNT(*) FILTER (WHERE class_id = ANY($2::bigint[]))::int AS graduate_users
+        FROM users
+        """,
+        [item[0] for item in promote],
+        [item[0] for item in graduate],
+    )
+    promoted_ids = [item[0] for item in promote]
+    graduating_ids = [item[0] for item in graduate]
+    source_ids = promoted_ids + graduating_ids
+    counts = await connection.fetchrow(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM teacher_class_assignments
+             WHERE class_id = ANY($1::bigint[]))::int AS teacher_assignments,
+            (SELECT COUNT(DISTINCT applications.id)
+             FROM teacher_applications AS applications
+             LEFT JOIN teacher_invites AS invites ON invites.id = applications.invite_id
+             LEFT JOIN teacher_application_classes AS selected
+                 ON selected.application_id = applications.id
+             WHERE applications.status = 'pending'
+               AND (invites.class_id = ANY($1::bigint[])
+                    OR selected.class_id = ANY($1::bigint[])))::int
+                AS pending_teacher_applications
+        """,
+        source_ids,
+    )
+    user_snapshot = await connection.fetch(
+        """
+        SELECT max_user_id, class_id FROM users
+        WHERE class_id = ANY($1::bigint[])
+        ORDER BY class_id, max_user_id
+        """,
+        source_ids,
+    )
+    teacher_snapshot = await connection.fetch(
+        """
+        SELECT teacher_max_user_id, class_id FROM teacher_class_assignments
+        WHERE class_id = ANY($1::bigint[])
+        ORDER BY class_id, teacher_max_user_id
+        """,
+        source_ids,
+    )
+    pending_snapshot = await connection.fetch(
+        """
+        SELECT DISTINCT applications.id, applications.max_user_id,
+               invites.class_id AS primary_class_id,
+               selected.class_id AS selected_class_id
+        FROM teacher_applications AS applications
+        LEFT JOIN teacher_invites AS invites ON invites.id = applications.invite_id
+        LEFT JOIN teacher_application_classes AS selected
+            ON selected.application_id = applications.id
+        WHERE applications.status = 'pending'
+          AND (invites.class_id = ANY($1::bigint[])
+               OR selected.class_id = ANY($1::bigint[]))
+        ORDER BY applications.id, selected.class_id
+        """,
+        source_ids,
+    )
+    token_payload = json.dumps(
+        {
+            "from_year": source_year,
+            "promote": promote,
+            "graduate": graduate,
+            "errors": errors,
+            "moved_users": int(user_counts["all_users"] or 0),
+            "unassigned_users": int(user_counts["graduate_users"] or 0),
+            "teacher_assignments": int(counts["teacher_assignments"] or 0),
+            "pending_teacher_applications": int(counts["pending_teacher_applications"] or 0),
+            "users": [(int(row["max_user_id"]), int(row["class_id"])) for row in user_snapshot],
+            "teacher_assignments_snapshot": [
+                (int(row["teacher_max_user_id"]), int(row["class_id"]))
+                for row in teacher_snapshot
+            ],
+            "pending_applications_snapshot": [
+                (
+                    int(row["id"]),
+                    int(row["max_user_id"]),
+                    int(row["primary_class_id"]) if row["primary_class_id"] is not None else None,
+                    int(row["selected_class_id"]) if row["selected_class_id"] is not None else None,
+                )
+                for row in pending_snapshot
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    application_classes: dict[int, dict[str, object]] = {}
+    for row in pending_snapshot:
+        app = application_classes.setdefault(
+            int(row["id"]),
+            {
+                "user_id": int(row["max_user_id"]),
+                "primary_class_id": row["primary_class_id"],
+                "selected_ids": set(),
+            },
+        )
+        if row["selected_class_id"] is not None:
+            app["selected_ids"].add(int(row["selected_class_id"]))
+    promoted_source_ids = {item[0] for item in promote}
+    graduating_source_ids = {item[0] for item in graduate}
+    rejected_applicants = [
+        int(app["user_id"])
+        for app in application_classes.values()
+        if app["primary_class_id"] in graduating_source_ids
+        and not app["selected_ids"].intersection(promoted_source_ids)
+    ]
+    return {
+        "from_year": source_year,
+        "to_year": target_year,
+        "promote": promote,
+        "graduate": graduate,
+        "errors": errors,
+        "already_done": prior is not None,
+        "moved_users": int(user_counts["all_users"] or 0),
+        "unassigned_users": int(user_counts["graduate_users"] or 0),
+        "teacher_assignments": int(counts["teacher_assignments"] or 0),
+        "pending_teacher_applications": int(counts["pending_teacher_applications"] or 0),
+        "rejected_applicants": rejected_applicants,
+        "preview_token": hashlib.sha256(token_payload.encode("utf-8")).hexdigest(),
+    }
+
+
+async def get_school_year_rollover_preview() -> dict[str, object]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            source_year = await connection.fetchval(
+                "SELECT value #>> '{}' FROM settings WHERE key = 'active_school_year'"
+            )
+            if not source_year:
+                raise RuntimeError("Не задан текущий учебный год")
+            return await _school_year_rollover_preview(connection, source_year)
+    finally:
+        await connection.close()
+
+
+async def rollover_school_year(
+    expected_source_year: str,
+    expected_preview_token: str,
+    performed_by: int,
+) -> tuple[str, dict[str, object]]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        async with connection.transaction():
+            current_year = await connection.fetchval(
+                """
+                SELECT value #>> '{}' FROM settings
+                WHERE key = 'active_school_year' FOR UPDATE
+                """
+            )
+            if current_year != expected_source_year:
+                return "year_changed", {"from_year": current_year}
+            preview = await _school_year_rollover_preview(connection, current_year)
+            if preview["already_done"]:
+                return "already_done", preview
+            if preview["preview_token"] != expected_preview_token:
+                return "preview_changed", preview
+            if not preview["promote"] and not preview["graduate"]:
+                return "no_classes", preview
+            if preview["errors"]:
+                return "conflict", preview
+
+            old_ids = [item[0] for item in preview["promote"]] + [
+                item[0] for item in preview["graduate"]
+            ]
+            graduate_ids = [item[0] for item in preview["graduate"]]
+            await connection.execute(
+                "UPDATE classes SET archived = TRUE WHERE id = ANY($1::bigint[])",
+                old_ids,
+            )
+            class_id_map: dict[int, int] = {}
+            alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+            for old_id, _old_name, new_name, age_group in preview["promote"]:
+                new_class_id = None
+                for _attempt in range(20):
+                    invite_code = "AKTIV-" + "".join(
+                        secrets.choice(alphabet) for _ in range(8)
+                    )
+                    inserted = await connection.fetchrow(
+                        """
+                        INSERT INTO classes (name, age_group, invite_code, academic_year)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT DO NOTHING
+                        RETURNING id
+                        """,
+                        new_name,
+                        age_group,
+                        invite_code,
+                        preview["to_year"],
+                    )
+                    if inserted is not None:
+                        new_class_id = int(inserted["id"])
+                        break
+                if new_class_id is None:
+                    raise RuntimeError("Не удалось создать уникальный код класса")
+                class_id_map[old_id] = new_class_id
+
+                for _attempt in range(20):
+                    teacher_code = "AKTIV-T-" + "".join(
+                        secrets.choice(alphabet) for _ in range(6)
+                    )
+                    result = await connection.execute(
+                        """
+                        INSERT INTO teacher_invites (code, class_id)
+                        VALUES ($1, $2) ON CONFLICT (code) DO NOTHING
+                        """,
+                        teacher_code,
+                        new_class_id,
+                    )
+                    if result == "INSERT 0 1":
+                        break
+                else:
+                    raise RuntimeError("Не удалось создать уникальный код учителя")
+
+            for old_id, new_id in class_id_map.items():
+                await connection.execute(
+                    """
+                    UPDATE users SET class_id = $2
+                    WHERE class_id = $1
+                    """,
+                    old_id,
+                    new_id,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO teacher_class_assignments (teacher_max_user_id, class_id)
+                    SELECT teacher_max_user_id, $2
+                    FROM teacher_class_assignments WHERE class_id = $1
+                    ON CONFLICT DO NOTHING
+                    """,
+                    old_id,
+                    new_id,
+                )
+                await connection.execute(
+                    """
+                    UPDATE teacher_application_classes
+                    SET class_id = $2 WHERE class_id = $1
+                    """,
+                    old_id,
+                    new_id,
+                )
+                await connection.execute(
+                    """
+                    UPDATE teacher_invites AS invites
+                    SET class_id = $2
+                    FROM teacher_applications AS applications
+                    WHERE applications.invite_id = invites.id
+                      AND applications.status = 'pending'
+                      AND invites.class_id = $1
+                    """,
+                    old_id,
+                    new_id,
+                )
+
+            if graduate_ids:
+                await connection.execute(
+                    "UPDATE users SET class_id = NULL WHERE class_id = ANY($1::bigint[])",
+                    graduate_ids,
+                )
+                await connection.execute(
+                    "DELETE FROM teacher_application_classes WHERE class_id = ANY($1::bigint[])",
+                    graduate_ids,
+                )
+                await connection.execute(
+                    """
+                    UPDATE teacher_invites AS invites
+                    SET class_id = (
+                        SELECT selected.class_id
+                        FROM teacher_applications AS applications
+                        JOIN teacher_application_classes AS selected
+                            ON selected.application_id = applications.id
+                        JOIN classes ON classes.id = selected.class_id
+                        WHERE applications.invite_id = invites.id
+                          AND applications.status = 'pending'
+                          AND classes.academic_year = $2
+                          AND classes.archived = FALSE
+                        ORDER BY selected.class_id
+                        LIMIT 1
+                    )
+                    WHERE invites.class_id = ANY($1::bigint[])
+                      AND EXISTS (
+                          SELECT 1
+                          FROM teacher_applications AS applications
+                          JOIN teacher_application_classes AS selected
+                              ON selected.application_id = applications.id
+                          JOIN classes ON classes.id = selected.class_id
+                          WHERE applications.invite_id = invites.id
+                            AND applications.status = 'pending'
+                            AND classes.academic_year = $2
+                            AND classes.archived = FALSE
+                      )
+                    """,
+                    graduate_ids,
+                    preview["to_year"],
+                )
+                await connection.execute(
+                    """
+                    UPDATE teacher_applications
+                    SET status = 'rejected',
+                        moderator_comment = 'Заявка закрыта при архивировании выпускного класса.',
+                        updated_at = NOW()
+                    WHERE status = 'pending' AND invite_id IN (
+                        SELECT id FROM teacher_invites WHERE class_id = ANY($1::bigint[])
+                    )
+                    """,
+                    graduate_ids,
+                )
+
+            await connection.execute(
+                "UPDATE events SET status = 'archived' WHERE author_class_id = ANY($1::bigint[])",
+                old_ids,
+            )
+            await connection.execute(
+                """
+                UPDATE teacher_invites SET status = 'revoked'
+                WHERE class_id = ANY($1::bigint[]) AND status = 'active'
+                """,
+                old_ids,
+            )
+            await connection.execute(
+                """
+                UPDATE settings SET value = $2::jsonb, updated_at = NOW()
+                WHERE key = 'active_school_year'
+                """,
+                "active_school_year",
+                json.dumps(preview["to_year"], ensure_ascii=False),
+            )
+            await connection.execute(
+                """
+                INSERT INTO school_year_rollovers (
+                    from_year, to_year, performed_by, promoted_classes,
+                    graduated_classes, moved_users, unassigned_users
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                preview["from_year"],
+                preview["to_year"],
+                performed_by,
+                len(preview["promote"]),
+                len(preview["graduate"]),
+                preview["moved_users"],
+                preview["unassigned_users"],
+            )
+            return "ok", preview
     finally:
         await connection.close()
 
@@ -1571,11 +2004,120 @@ async def get_current_month_value() -> str | None:
         await connection.close()
 
 
+async def get_admin_month_dashboard() -> dict[str, object]:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await close_due_rating_periods(connection)
+        today = moscow_today()
+        current_month = month_start(today)
+        previous_month = month_start(today - timedelta(days=1))
+        report_month = (
+            month_start(today - timedelta(days=1))
+            if today.day <= 5
+            else current_month
+        )
+        current = await connection.fetchrow(
+            """
+            SELECT monthly_value, status, closed_at
+            FROM rating_periods WHERE period_month = $1
+            """,
+            current_month,
+        )
+        report_period = await connection.fetchrow(
+            "SELECT status FROM rating_periods WHERE period_month = $1",
+            report_month,
+        )
+        previous_period = await connection.fetchrow(
+            "SELECT status FROM rating_periods WHERE period_month = $1",
+            previous_month,
+        )
+        queues = await connection.fetchrow(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM teacher_applications WHERE status = 'pending')::int
+                    AS teacher_applications,
+                (SELECT COUNT(*) FROM reports WHERE status = 'pending')::int AS reports,
+                (SELECT COUNT(*) FROM ideas WHERE status = 'pending')::int AS ideas
+            """
+        )
+        return {
+            "today": today,
+            "current_month": current_month,
+            "current_value": current["monthly_value"] if current else None,
+            "current_status": current["status"] if current else "not_open",
+            "current_closed_at": current["closed_at"] if current else None,
+            "previous_month": previous_month,
+            "previous_status": previous_period["status"] if previous_period else "not_open",
+            "report_month": report_month,
+            "report_deadline": report_deadline(report_month),
+            "report_status": report_period["status"] if report_period else "not_open",
+            "pending_teacher_applications": int(queues["teacher_applications"]),
+            "pending_reports": int(queues["reports"]),
+            "pending_ideas": int(queues["ideas"]),
+        }
+    finally:
+        await connection.close()
+
+
+async def get_deadline_reminder_info(
+    reminder_date: date,
+) -> tuple[date, int, set[int]] | None:
+    if reminder_date.day not in {1, 3, 5}:
+        return None
+    period_month = month_start(reminder_date - timedelta(days=1))
+    if not is_school_month(period_month):
+        return None
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        period = await connection.fetchrow(
+            "SELECT status FROM rating_periods WHERE period_month = $1",
+            period_month,
+        )
+        if period is None or period["status"] != "open":
+            return None
+        sent_to = await connection.fetch(
+            "SELECT admin_max_user_id FROM admin_deadline_reminders WHERE reminder_date = $1",
+            reminder_date,
+        )
+        pending_reports = await connection.fetchval(
+            """
+            SELECT COUNT(*) FROM reports
+            JOIN events ON events.id = reports.event_id
+            WHERE reports.status = 'pending'
+              AND events.event_date >= $1
+              AND events.event_date < $2
+            """,
+            period_month,
+            next_month(period_month),
+        )
+        return period_month, int(pending_reports), {
+            int(row["admin_max_user_id"]) for row in sent_to
+        }
+    finally:
+        await connection.close()
+
+
+async def mark_deadline_reminder_sent(reminder_date: date, admin_max_user_id: int) -> None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        await connection.execute(
+            """
+            INSERT INTO admin_deadline_reminders (reminder_date, admin_max_user_id)
+            VALUES ($1, $2) ON CONFLICT (reminder_date, admin_max_user_id) DO NOTHING
+            """,
+            reminder_date,
+            admin_max_user_id,
+        )
+    finally:
+        await connection.close()
+
+
 async def _list_period_rating(
     connection: asyncpg.Connection,
     period_month: date,
     age_group: str | None = None,
 ) -> list[tuple[str, str, int, bool]]:
+    year_label = academic_year_label(period_month)
     rows = await connection.fetch(
         """
         SELECT classes.name, classes.age_group,
@@ -1594,10 +2136,15 @@ async def _list_period_rating(
             ON rating_winners.period_id = rating_periods.id
            AND rating_winners.class_id = classes.id
         WHERE ($2::text IS NULL OR classes.age_group = $2)
+          AND (
+              classes.academic_year = $3
+              OR totals.class_id IS NOT NULL
+          )
         ORDER BY points DESC, classes.age_group, classes.name
         """,
         period_month,
         age_group,
+        year_label,
     )
     return [
         (row["name"], row["age_group"], row["points"], row["is_winner"])
@@ -1628,7 +2175,11 @@ async def list_academic_year_rating(
     try:
         await close_due_rating_periods(connection)
         today = moscow_today()
-        start = academic_year_start(today)
+        active_year = await connection.fetchval(
+            "SELECT value #>> '{}' FROM settings WHERE key = 'active_school_year'"
+        )
+        start_year = int(active_year.split("/", 1)[0])
+        start = date(start_year, 9, 1)
         end = date(start.year + 1, 5, 1)
         closed_count = await connection.fetchval(
             """
@@ -1655,11 +2206,13 @@ async def list_academic_year_rating(
                 GROUP BY class_id
             ) totals ON totals.class_id = classes.id
             WHERE ($3::text IS NULL OR classes.age_group = $3)
+              AND classes.academic_year = $4
             ORDER BY points DESC, classes.age_group, classes.name
             """,
             start,
             end,
             age_group,
+            active_year,
         )
         rating = [
             (row["name"], row["age_group"], row["points"], False)
@@ -1673,7 +2226,7 @@ async def list_academic_year_rating(
                 (name, age_group, points, points == maxima[age_group] and points > 0)
                 for name, age_group, points, _ in rating
             ]
-        return academic_year_label(today), int(closed_count), complete, rating
+        return active_year, int(closed_count), complete, rating
     finally:
         await connection.close()
 
@@ -1740,6 +2293,107 @@ async def get_month_rating(period_month: date, age_group: str | None = None):
         await connection.close()
 
 
+async def get_class_rating_breakdown(
+    class_name: str,
+    age_group: str,
+    academic_year: str,
+    period_start: date,
+    period_end: date,
+) -> dict[str, object] | None:
+    connection = await asyncpg.connect(get_database_url())
+    try:
+        class_row = await connection.fetchrow(
+            """
+            SELECT id, name, age_group
+            FROM classes
+            WHERE name = $1 AND age_group = $2
+              AND (
+                  academic_year = $3
+                  OR EXISTS (
+                      SELECT 1 FROM points_log
+                      WHERE points_log.class_id = classes.id
+                        AND points_log.period_month BETWEEN $4 AND $5
+                  )
+              )
+            ORDER BY (academic_year = $3) DESC
+            LIMIT 1
+            """,
+            class_name,
+            age_group,
+            academic_year,
+            period_start,
+            period_end,
+        )
+        if class_row is None:
+            return None
+        point_rows = await connection.fetch(
+            """
+            SELECT reason, points, period_month
+            FROM points_log
+            WHERE class_id = $1 AND period_month BETWEEN $2 AND $3
+            ORDER BY period_month, id
+            """,
+            class_row["id"],
+            period_start,
+            period_end,
+        )
+        categories: dict[str, dict[str, object]] = {
+            "reports": {"label": "Отчёты", "points": 0, "count": 0, "entries": []},
+            "ideas": {"label": "Идеи", "points": 0, "count": 0, "entries": []},
+            "prizes": {"label": "Призовые места", "points": 0, "count": 0, "entries": []},
+            "bonuses": {"label": "Дополнительные баллы", "points": 0, "count": 0, "entries": []},
+            "other": {"label": "Другие начисления", "points": 0, "count": 0, "entries": []},
+        }
+        total = 0
+        for row in point_rows:
+            reason = row["reason"]
+            if reason.startswith("Отчёт №"):
+                key = "reports"
+            elif reason.startswith("Идея №"):
+                key = "ideas"
+            elif reason.startswith("Призовое место:"):
+                key = "prizes"
+            elif reason.startswith("Ежемесячный бонус:"):
+                key = "bonuses"
+            else:
+                key = "other"
+            bucket = categories[key]
+            points = int(row["points"])
+            bucket["points"] = int(bucket["points"]) + points
+            bucket["count"] = int(bucket["count"]) + 1
+            entries = bucket["entries"]
+            entries.append({
+                "reason": reason,
+                "points": points,
+                "month": row["period_month"],
+            })
+            total += points
+
+        penalties = await connection.fetch(
+            """
+            SELECT period_month, teacher_max_user_id, note, created_at
+            FROM discipline_penalties
+            WHERE class_id = $1 AND period_month BETWEEN $2 AND $3
+            ORDER BY period_month, id
+            """,
+            class_row["id"],
+            period_start,
+            period_end,
+        )
+        return {
+            "class_name": class_row["name"],
+            "age_group": class_row["age_group"],
+            "academic_year": academic_year,
+            "period_start": period_start,
+            "period_end": period_end,
+            "total": total,
+            "categories": categories,
+            "penalties": [dict(row) for row in penalties],
+        }
+    finally:
+        await connection.close()
+
+
 async def list_rating() -> list[tuple[str, str, int]]:
     """Совместимость со старым вызовом: теперь это рейтинг текущего месяца."""
     _period_month, _value, rating = await list_current_month_rating()
@@ -1764,6 +2418,9 @@ async def get_class_place(max_user_id: int) -> tuple[int, str, str, int] | None:
                 LEFT JOIN points_log
                     ON points_log.class_id = classes.id
                    AND points_log.period_month = $1
+                WHERE classes.academic_year = (
+                    SELECT value #>> '{}' FROM settings WHERE key = 'active_school_year'
+                ) AND classes.archived = FALSE
                 GROUP BY classes.id, classes.name, classes.age_group
             )
             SELECT ranked_classes.place, ranked_classes.name,
@@ -2029,7 +2686,13 @@ async def award_prize(class_name: str, place: int, confirmer_id: int) -> tuple[b
             if not opened or not is_school_month(current_month):
                 return False, None
             class_row = await connection.fetchrow(
-                "SELECT id FROM classes WHERE name = $1",
+                """
+                SELECT id FROM classes
+                WHERE name = $1 AND archived = FALSE
+                  AND academic_year = (
+                      SELECT value #>> '{}' FROM settings WHERE key = 'active_school_year'
+                  )
+                """,
                 class_name,
             )
             if class_row is None:

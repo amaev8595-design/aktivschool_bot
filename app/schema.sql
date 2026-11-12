@@ -10,6 +10,21 @@ CREATE TABLE IF NOT EXISTS classes (
 ALTER TABLE classes
     ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT FALSE;
 
+ALTER TABLE classes ADD COLUMN IF NOT EXISTS academic_year TEXT;
+UPDATE classes
+SET academic_year = CASE
+    WHEN EXTRACT(MONTH FROM timezone('Europe/Moscow', NOW()))::int >= 9
+        THEN EXTRACT(YEAR FROM timezone('Europe/Moscow', NOW()))::int::text || '/' ||
+             (EXTRACT(YEAR FROM timezone('Europe/Moscow', NOW()))::int + 1)::text
+    ELSE (EXTRACT(YEAR FROM timezone('Europe/Moscow', NOW()))::int - 1)::text || '/' ||
+         EXTRACT(YEAR FROM timezone('Europe/Moscow', NOW()))::int::text
+END
+WHERE academic_year IS NULL;
+ALTER TABLE classes ALTER COLUMN academic_year SET NOT NULL;
+ALTER TABLE classes DROP CONSTRAINT IF EXISTS classes_name_key;
+CREATE UNIQUE INDEX IF NOT EXISTS classes_active_name_unique
+    ON classes (name) WHERE archived = FALSE;
+
 CREATE TABLE IF NOT EXISTS users (
     id BIGSERIAL PRIMARY KEY,
     max_user_id BIGINT NOT NULL UNIQUE,
@@ -251,8 +266,35 @@ CREATE TABLE IF NOT EXISTS settings (
 INSERT INTO settings (key, value)
 VALUES
     ('monthly_value', '"Взаимопомощь"'),
+    ('active_school_year', to_jsonb(
+        CASE
+            WHEN EXTRACT(MONTH FROM timezone('Europe/Moscow', NOW()))::int >= 9
+                THEN EXTRACT(YEAR FROM timezone('Europe/Moscow', NOW()))::int::text || '/' ||
+                     (EXTRACT(YEAR FROM timezone('Europe/Moscow', NOW()))::int + 1)::text
+            ELSE (EXTRACT(YEAR FROM timezone('Europe/Moscow', NOW()))::int - 1)::text || '/' ||
+                 EXTRACT(YEAR FROM timezone('Europe/Moscow', NOW()))::int::text
+        END
+    )),
     ('monthly_approval_limit', '5'),
     ('class_idea_limit', '3'),
     ('points_scale', '{"participation": 5, "approved_idea": 10, "prize_place": 15}')
 ON CONFLICT (key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS school_year_rollovers (
+    from_year TEXT PRIMARY KEY,
+    to_year TEXT NOT NULL,
+    performed_by BIGINT NOT NULL,
+    promoted_classes INTEGER NOT NULL,
+    graduated_classes INTEGER NOT NULL,
+    moved_users INTEGER NOT NULL,
+    unassigned_users INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS admin_deadline_reminders (
+    reminder_date DATE NOT NULL,
+    admin_max_user_id BIGINT NOT NULL,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (reminder_date, admin_max_user_id)
+);
 
