@@ -637,11 +637,11 @@ async def moderate_teacher_application(
                 await connection.execute(
                     """
                     INSERT INTO teacher_class_assignments (teacher_max_user_id, class_id)
-                    SELECT $1, class_id
+                    SELECT $1::BIGINT, class_id
                     FROM teacher_application_classes
                     WHERE application_id = $2
                     UNION
-                    SELECT $1, $3
+                    SELECT $1::BIGINT, $3
                     ON CONFLICT DO NOTHING
                     """,
                     row["max_user_id"],
