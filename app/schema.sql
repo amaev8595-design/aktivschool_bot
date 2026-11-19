@@ -276,7 +276,7 @@ VALUES
         END
     )),
     ('monthly_approval_limit', '5'),
-    ('class_idea_limit', '3'),
+    ('class_idea_limit', '1'),
     ('points_scale', '{"participation": 5, "approved_idea": 10, "prize_place": 15}')
 ON CONFLICT (key) DO NOTHING;
 

@@ -2572,7 +2572,7 @@ async def create_idea(
                        COALESCE((
                            SELECT (value #>> '{}')::int
                            FROM settings WHERE key = 'class_idea_limit'
-                       ), 3) AS idea_limit
+                       ), 1) AS idea_limit
                 FROM ideas
                 WHERE author_class_id = $1
                   AND (created_at AT TIME ZONE 'Europe/Moscow')::date >= $2
